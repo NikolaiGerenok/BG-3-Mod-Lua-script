@@ -1,18 +1,31 @@
--- DanceWithSource - Sacred Ground surface dispatcher (v15)
+-- DanceWithSource - Sacred Ground surface dispatcher (v16)
 --
--- Heal model (stats-driven, one StackId instance each -- no 3/2/1 stacks):
---   Fire:   instant 1d4 on BURNING + DWS_SACRED_REGEN_FIRE (StartTurn 1d4, refreshed on tile)
---   Water:  DWS_SACRED_REGEN_WATER (EndTurn 2d4, refreshed on tile)
---   Poison: DWS_SACRED_REGEN (StartTurn 1d4, 18s = 3 turns, refreshed while on tile)
--- Lightning: DWS_SACRED_LIGHTNING 18s haste (no AC ward), refreshed on electrified tile 
+-- Per bug report 2026-06-28:
+--   * Heals are 100% poll-driven (work in AND out of combat, no 4x stacking).
+--       Fire:   instant 1d4 on entry + 1d4 every turn (~6s) while standing.
+--       Water:  2d4 every turn (~6s) while standing.
+--       Poison: 2d4 every turn for 3 turns; PERSISTS after leaving tile/aura.
+--   * Poison & Lightning are PERSISTENT - not stripped on aura exit / turn end.
+--   * Poison removes POISONED; Electrified removes shock; both re-applied while on tile.
+--   * Ice Agathys cooldown = 3 turns (was 5); cooldown survives aura re-entry (no spam).
+--   * Lightning grants real speed (ActionResourceMultiplier) + shock immunity.
 
-local MOD_TAG = "[DWS v15]"
+local MOD_TAG = "[DWS v16]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
-local HEAL_INSTANT_1D4 = "DWS_SACRED_HEAL_1D4"
-local REGEN_FIRE   = "DWS_SACRED_REGEN_FIRE"
-local REGEN_WATER  = "DWS_SACRED_REGEN_WATER"
-local REGEN_POISON = "DWS_SACRED_REGEN"
+local HEAL_1D4 = "DWS_SACRED_HEAL_1D4"
+local HEAL_2D4 = "DWS_SACRED_HEAL_2D4"
+
+-- 1 BG3 turn = 6s; poll = 2s -> 3 polls per turn
+local POLL_INTERVAL_MS  = 2000
+local POLLS_PER_TURN     = 3
+local SACRED_DURATION    = 6     -- managed surface buff, refreshed while standing
+local PERSIST_DURATION   = 18    -- poison resist / lightning: 3 turns, persists
+local POISON_HEAL_POLLS  = 9     -- 3 turns of poison regen
+local AGATHYS_DURATION   = 30
+local AGATHYS_CD_POLLS   = 9     -- 3 turns
+local BLOODLUST_DURATION = 6
+local BLOOD_COOLDOWN     = 6
 
 local SurfaceGroundConversions = {
     ["SurfaceFire"]               = "DWS_SACRED_FIRE",
@@ -57,58 +70,44 @@ local SurfaceStatusTriggers = {
 }
 
 local SHOCK_STATUS_NAMES = {
-    "SHOCKED",
-    "ELECTROCUTED",
-    "ELECTRIFIED",
-    "SURFACE_ELECTROCUTED",
+    "SHOCKED", "ELECTROCUTED", "ELECTRIFIED", "SURFACE_ELECTROCUTED",
 }
 
+-- Stripped when leaving the aura / at turn end if not refreshed this turn.
 local ManagedSacred = {
     "DWS_SACRED_FIRE",
-    "DWS_SACRED_POISON",
     "DWS_SACRED_CLEANSE_WATHER",
     "DWS_SACRED_OIL",
     "DWS_SACRED_ICE",
-    "DWS_SACRED_BLOOD",
-    "DWS_SACRED_LIGHTNING",
     "DWS_SACRED_ACID",
-    "DWS_SACRED_ICE_AGATHYS",
-    "DWS_SACRED_BLOOD_LUST",
-    "DWS_SACRED_BLOOD_CD",
+    "DWS_SACRED_BLOOD",
 }
 
-local TurnEndedExempt = {
-    ["DWS_SACRED_ICE_AGATHYS"] = true,
-    ["DWS_SACRED_BLOOD_LUST"]  = true,
-    ["DWS_SACRED_BLOOD_CD"]    = true,
+-- Never auto-stripped; rely on their own duration.
+local PersistentSacred = {
+    ["DWS_SACRED_POISON"]       = true,
+    ["DWS_SACRED_LIGHTNING"]    = true,
+    ["DWS_SACRED_ICE_AGATHYS"]  = true,
+    ["DWS_SACRED_BLOOD_LUST"]   = true,
+    ["DWS_SACRED_BLOOD_CD"]     = true,
 }
-
-local SACRED_DURATION        = 6    -- 1 turn surface buff refresh
-local LIGHTNING_DURATION     = 18   -- 3 turns haste
-local POISON_REGEN_DURATION  = 18   -- 3 turns poison regen
-local REGEN_TILE_DURATION    = 6    -- 1 turn, refreshed each poll while on tile
-local POLL_INTERVAL_MS       = 2000
-local AGATHYS_DURATION       = 30
-local AGATHYS_COOLDOWN_POLLS = 15
-local BLOODLUST_DURATION     = 6
-local BLOOD_COOLDOWN         = 6
 
 local pollCounter           = 0
-local markedCharacters      = {}
-local refreshedThisTurn     = {}
-local lastLoggedSacred      = {}
-local unmappedSurfaceSeen   = {}
-local agathysCooldownUntil  = {}
+local markedCharacters      = {}   -- key -> guid
+local refreshedThisTurn     = {}   -- key -> { sacred -> true }
+local lastLoggedSacred      = {}   -- key -> sacred|nil
+local unmappedSurfaceSeen   = {}   -- key -> { surface -> true }
+local healCadence           = {}   -- key -> { kind -> lastPoll }
+local poisonHeal            = {}   -- key -> { guid=, until= }
+local agathysCdUntil        = {}   -- key -> pollCounter deadline
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
 
-local function guidKey(guid)
-    return tostring(guid)
-end
+local function guidKey(guid) return tostring(guid) end
 
 local function hasStatus(objectGuid, statusName)
-    local result = Osi.HasActiveStatus(objectGuid, statusName)
-    return result == 1 or result == true
+    local r = Osi.HasActiveStatus(objectGuid, statusName)
+    return r == 1 or r == true
 end
 
 local function safe(fn)
@@ -139,60 +138,64 @@ local function applyStatus(objectGuid, statusName, duration)
     Osi.ApplyStatus(objectGuid, statusName, duration, 1, objectGuid)
 end
 
-local function refreshRegenWhileOnTile(objectGuid, sacred)
-    if sacred == "DWS_SACRED_FIRE" then
-        applyStatus(objectGuid, REGEN_FIRE, REGEN_TILE_DURATION)
-    elseif sacred == "DWS_SACRED_CLEANSE_WATHER" then
-        applyStatus(objectGuid, REGEN_WATER, REGEN_TILE_DURATION)
-    elseif sacred == "DWS_SACRED_POISON" then
-        -- Same StackId -> one instance; re-apply resets duration to 18s
-        applyStatus(objectGuid, REGEN_POISON, POISON_REGEN_DURATION)
+-- Heal "kind" once per turn (cadence) using an instant OnApply heal status.
+local function periodicHeal(guid, kind, healStatus, forceNow)
+    local key = guidKey(guid)
+    healCadence[key] = healCadence[key] or {}
+    local last = healCadence[key][kind]
+    if forceNow or last == nil or (pollCounter - last) >= POLLS_PER_TURN then
+        healCadence[key][kind] = pollCounter
+        applyStatus(guid, healStatus, 1)
+        return true
     end
-end
-
-local function fireBurstHeal(objectGuid)
-    applyStatus(objectGuid, HEAL_INSTANT_1D4, 0)
-end
-
-local function refreshSacred(objectGuid, sacred)
-    applyStatus(objectGuid, sacred, SACRED_DURATION)
-    markRefreshed(objectGuid, sacred)
-    refreshRegenWhileOnTile(objectGuid, sacred)
+    return false
 end
 
 local function stripShockStatuses(objectGuid)
-    for _, statusName in ipairs(SHOCK_STATUS_NAMES) do
-        if hasStatus(objectGuid, statusName) then
-            Osi.RemoveStatus(objectGuid, statusName)
-        end
+    for _, s in ipairs(SHOCK_STATUS_NAMES) do
+        if hasStatus(objectGuid, s) then Osi.RemoveStatus(objectGuid, s) end
     end
 end
 
 local function applyElectrifiedLightning(objectGuid)
     stripShockStatuses(objectGuid)
-    applyStatus(objectGuid, "DWS_SACRED_LIGHTNING", LIGHTNING_DURATION)
+    applyStatus(objectGuid, "DWS_SACRED_LIGHTNING", PERSIST_DURATION)
     markRefreshed(objectGuid, "DWS_SACRED_LIGHTNING")
+end
+
+local function startOrRefreshPoison(objectGuid)
+    local key = guidKey(objectGuid)
+    Osi.RemoveStatus(objectGuid, "POISONED")
+    applyStatus(objectGuid, "DWS_SACRED_POISON", PERSIST_DURATION)
+    markRefreshed(objectGuid, "DWS_SACRED_POISON")
+
+    local fresh = (poisonHeal[key] == nil)
+    poisonHeal[key] = { guid = objectGuid, untilPoll = pollCounter + POISON_HEAL_POLLS }
+    if fresh then
+        periodicHeal(objectGuid, "poison", HEAL_2D4, true)
+        Ext.Utils.Print(MOD_TAG .. " poison regen (3 turns) on " .. key)
+    end
 end
 
 local function maybeGrantIceAgathys(objectGuid)
     local key = guidKey(objectGuid)
-    if pollCounter < (agathysCooldownUntil[key] or 0) then return end
-
+    if pollCounter < (agathysCdUntil[key] or 0) then return end
     applyStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS", AGATHYS_DURATION)
-    agathysCooldownUntil[key] = pollCounter + AGATHYS_COOLDOWN_POLLS
+    agathysCdUntil[key] = pollCounter + AGATHYS_CD_POLLS
     markRefreshed(objectGuid, "DWS_SACRED_ICE_AGATHYS")
     Ext.Utils.Print(MOD_TAG .. " ice agathys granted to " .. key)
 end
 
 local function logIfChanged(guid, sacred)
     local key = guidKey(guid)
-    if lastLoggedSacred[key] == sacred then return end
+    if lastLoggedSacred[key] == sacred then return false end
     lastLoggedSacred[key] = sacred
     if sacred then
         Ext.Utils.Print(MOD_TAG .. " " .. key .. " on surface -> " .. sacred)
     else
         Ext.Utils.Print(MOD_TAG .. " " .. key .. " left mapped surface")
     end
+    return true
 end
 
 local function noteUnmappedSurface(guid, surfaceName)
@@ -200,10 +203,31 @@ local function noteUnmappedSurface(guid, surfaceName)
     unmappedSurfaceSeen[key] = unmappedSurfaceSeen[key] or {}
     if unmappedSurfaceSeen[key][surfaceName] then return end
     unmappedSurfaceSeen[key][surfaceName] = true
-    Ext.Utils.Print(
-        MOD_TAG .. " (new unmapped surface '" .. tostring(surfaceName) ..
-        "' under " .. key .. ")"
-    )
+    Ext.Utils.Print(MOD_TAG .. " (new unmapped surface '" ..
+        tostring(surfaceName) .. "' under " .. key .. ")")
+end
+
+-- Apply the surface-specific buff while standing; drive per-turn heals.
+local function applySurfaceEffect(guid, sacred, isNew)
+    if sacred == "DWS_SACRED_POISON" then
+        startOrRefreshPoison(guid)
+        return
+    end
+    if sacred == "DWS_SACRED_LIGHTNING" then
+        applyElectrifiedLightning(guid)
+        return
+    end
+
+    applyStatus(guid, sacred, SACRED_DURATION)
+    markRefreshed(guid, sacred)
+
+    if sacred == "DWS_SACRED_FIRE" then
+        periodicHeal(guid, "fire", HEAL_1D4, isNew)
+    elseif sacred == "DWS_SACRED_CLEANSE_WATHER" then
+        periodicHeal(guid, "water", HEAL_2D4, false)
+    elseif sacred == "DWS_SACRED_ICE" then
+        maybeGrantIceAgathys(guid)
+    end
 end
 
 local function pollAndApplySurface(characterGuid)
@@ -211,16 +235,13 @@ local function pollAndApplySurface(characterGuid)
 
     local surfaceName = Osi.GetSurfaceGroundAt(characterGuid)
     if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
-        local key = guidKey(characterGuid)
-        local previousSacred = lastLoggedSacred[key]
-
         logIfChanged(characterGuid, nil)
         return
     end
 
     if isElectrifiedSurface(surfaceName) then
-        applyElectrifiedLightning(characterGuid)
-        logIfChanged(characterGuid, "DWS_SACRED_LIGHTNING")
+        local isNew = logIfChanged(characterGuid, "DWS_SACRED_LIGHTNING")
+        applySurfaceEffect(characterGuid, "DWS_SACRED_LIGHTNING", isNew)
         return
     end
 
@@ -231,15 +252,8 @@ local function pollAndApplySurface(characterGuid)
         return
     end
 
-    logIfChanged(characterGuid, sacred)
-    refreshSacred(characterGuid, sacred)
-
-    if sacred == "DWS_SACRED_FIRE" and previousSacred ~= "DWS_SACRED_FIRE" then
-        fireBurstHeal(characterGuid)
-
-    if sacred == "DWS_SACRED_ICE" then
-        maybeGrantIceAgathys(characterGuid)
-    end
+    local isNew = logIfChanged(characterGuid, sacred)
+    applySurfaceEffect(characterGuid, sacred, isNew)
 end
 
 local function onStatusApplied(objectGuid, statusName, _, _)
@@ -260,35 +274,17 @@ local function onStatusApplied(objectGuid, statusName, _, _)
     safe(function()
         if not hasStatus(objectGuid, SACRED_MARK) then return end
 
-        if statusName == "BURNING" then
-            local surfaceName = Osi.GetSurfaceGroundAt(objectGuid)
-            local fromSurface = SurfaceGroundConversions[tostring(surfaceName)]
-            if fromSurface == "DWS_SACRED_FIRE" then
-                Osi.RemoveStatus(objectGuid, statusName)
-                return
-            end
-        end
-
         if statusName == "WET" then
             local surfaceName = Osi.GetSurfaceGroundAt(objectGuid)
             if isElectrifiedSurface(surfaceName) then return end
         end
 
         Osi.RemoveStatus(objectGuid, statusName)
+        local isNew = (lastLoggedSacred[guidKey(objectGuid)] ~= sacred)
+        applySurfaceEffect(objectGuid, sacred, isNew)
 
-        if sacred == "DWS_SACRED_LIGHTNING" then
-            applyElectrifiedLightning(objectGuid)
-        else
-            refreshSacred(objectGuid, sacred)
-            if sacred == "DWS_SACRED_FIRE" then
-                fireBurstHeal(objectGuid)
-            end
-        end
-
-        Ext.Utils.Print(
-            MOD_TAG .. " " .. statusName .. " -> " .. sacred ..
-            " on " .. guidKey(objectGuid)
-        )
+        Ext.Utils.Print(MOD_TAG .. " " .. statusName .. " -> " .. sacred ..
+            " on " .. guidKey(objectGuid))
     end)
 end
 
@@ -296,34 +292,26 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
     if statusName ~= SACRED_MARK then return end
 
     local key = guidKey(objectGuid)
-    markedCharacters[key]     = nil
-    refreshedThisTurn[key]    = nil
-    lastLoggedSacred[key]     = nil
-    unmappedSurfaceSeen[key]  = nil
-    agathysCooldownUntil[key] = nil
-    -- REGEN_POISON / REGEN_FIRE / REGEN_WATER intentionally kept after aura exit
+    markedCharacters[key]    = nil
+    refreshedThisTurn[key]   = nil
+    lastLoggedSacred[key]    = nil
+    unmappedSurfaceSeen[key] = nil
+    healCadence[key]         = nil
+    -- poisonHeal / agathysCdUntil intentionally kept (persist after aura exit)
 
     safe(function()
         for _, sacred in ipairs(ManagedSacred) do
             if hasStatus(objectGuid, sacred) then
                 Osi.RemoveStatus(objectGuid, sacred)
-                Ext.Utils.Print(
-                    MOD_TAG .. " aura ended -> stripped " .. sacred ..
-                    " from " .. key
-                )
+                Ext.Utils.Print(MOD_TAG .. " aura ended -> stripped " ..
+                    sacred .. " from " .. key)
             end
         end
     end)
 end
 
 local function onTurnStarted(characterGuid)
-    safe(function()
-        pollAndApplySurface(characterGuid)
-        
-        if wasRefreshed(characterGuid, "DWS_SACRED_POISON") then
-            applyStatus(characterGuid, REGEN_POISON, POISON_REGEN_DURATION)
-        end
-    end)
+    safe(function() pollAndApplySurface(characterGuid) end)
 end
 
 local function onTurnEnded(characterGuid)
@@ -331,17 +319,9 @@ local function onTurnEnded(characterGuid)
         for _, sacred in ipairs(ManagedSacred) do
             if hasStatus(characterGuid, sacred)
                and not wasRefreshed(characterGuid, sacred)
-               and not TurnEndedExempt[sacred] then
+               and not PersistentSacred[sacred] then
                 Osi.RemoveStatus(characterGuid, sacred)
-                Ext.Utils.Print(
-                    MOD_TAG .. " turn end off-surface -> stripped " ..
-                    sacred .. " from " .. guidKey(characterGuid)
-                )
             end
-        end
-        -- Water EndTurn tick handled by REGEN_WATER status
-        if wasRefreshed(characterGuid, "DWS_SACRED_CLEANSE_WATHER") then
-            applyStatus(characterGuid, REGEN_WATER, REGEN_TILE_DURATION)
         end
         refreshedThisTurn[guidKey(characterGuid)] = nil
     end)
@@ -362,6 +342,16 @@ local function onKilledBy(_, _, attacker, _)
     end)
 end
 
+local function processPoisonHeals()
+    for key, info in pairs(poisonHeal) do
+        if pollCounter > info.untilPoll then
+            poisonHeal[key] = nil
+        else
+            periodicHeal(info.guid, "poison", HEAL_2D4, false)
+        end
+    end
+end
+
 local function surfacePollTick()
     pollCounter = pollCounter + 1
     safe(function()
@@ -370,10 +360,12 @@ local function surfacePollTick()
                 markedCharacters[key]    = nil
                 lastLoggedSacred[key]    = nil
                 unmappedSurfaceSeen[key] = nil
+                healCadence[key]         = nil
             else
                 pollAndApplySurface(guid)
             end
         end
+        processPoisonHeals()
     end)
     Ext.Timer.WaitFor(POLL_INTERVAL_MS, surfacePollTick)
 end

@@ -1,21 +1,9 @@
--- DanceWithSource - Sacred Ground surface dispatcher (v18)
---
--- Per bug report 2026-06-30:
---   * Heals are now TURN-DRIVEN in combat (no more mid-turn spam):
---       Fire:   instant 1d4 on entry + 1d4 at START of each turn while standing.
---       Water:  2d4 at END of each turn while standing.
---       Poison: 2d4 for 3 turns (start of turn), PERSISTS after leaving tile/aura.
---     Out of combat (no turns) heals tick from the poll timer at ~1 per 6s.
---     A monotonic-time guard prevents any double-heal of the same kind.
---   * Ice Agathys no longer spams: temp HP is not re-granted while it is still
---     active, and a 3-turn cooldown gates re-grant afterwards.
---   * Ice now grants Advantage(AllSavingThrows) (covers saves + concentration).
---   * Lightning dumps the real shock status names on entry (diagnostic) and
---     strips them, then applies the speed/immunity buff.
-
+-- DanceWithSource - Sacred Ground surface dispatcher (v19)
+-- Add cursed surface
 local MOD_TAG = "[DWS v19]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
+local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
 local HEAL_1D4 = "DWS_SACRED_HEAL_1D4"
 local HEAL_2D4 = "DWS_SACRED_HEAL_2D4"
 
@@ -65,6 +53,12 @@ local SurfaceGroundConversions = {
     ["SurfaceAcidCloud"]          = "DWS_SACRED_ACID",
 }
 
+local CursedSurfaceConversions = {
+    ["SurfaceFire"]               = "DWS_CURSED_FIRE",
+    ["SurfaceFireBlessed"]        = "DWS_CURSED_FIRE",
+    ["SurfaceFireCursed"]         = "DWS_CURSED_FIRE",
+    ["SurfaceHellfire"]           = "DWS_CURSED_FIRE",
+}
 local SurfaceStatusTriggers = {
     ["BURNING"]        = "DWS_SACRED_FIRE",
     ["POISONED"]       = "DWS_SACRED_POISON",
@@ -87,6 +81,7 @@ local ManagedSacred = {
     "DWS_SACRED_ICE",
     "DWS_SACRED_ACID",
     "DWS_SACRED_BLOOD",
+    "DWS_CURSED_FIRE",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -128,6 +123,20 @@ local function safe(fn)
     if not ok then
         Ext.Utils.Print(MOD_TAG .. " Osi error: " .. tostring(err))
     end
+end
+
+local function getActiveZoneMark(guid)
+    if hasStatus(guid, CURSED_MARK) then
+        return CURSED_MARK, CursedSurfaceConversions
+    end
+    if hasStatus(guid, SACRED_MARK) then
+        return SACRED_MARK, SurfaceGroundConversions
+    end
+    return nil, nil
+end
+
+local function hasAnyZoneMark(guid)
+    return hasStatus(guid, SACRED_MARK) or hasStatus(guid, CURSED_MARK)
 end
 
 local function markRefreshed(guid, sacred)
@@ -321,7 +330,8 @@ local function applySurfaceEffect(guid, sacred, isNew)
 end
 
 local function pollAndApplySurface(characterGuid)
-    if not hasStatus(characterGuid, SACRED_MARK) then return end
+    local mark, conversions = getActiveZoneMark(characterGuid)
+    if not mark then return end
 
     local surfaceName = Osi.GetSurfaceGroundAt(characterGuid)
     if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
@@ -329,23 +339,22 @@ local function pollAndApplySurface(characterGuid)
         return
     end
 
-    if isElectrifiedSurface(surfaceName) then
+    if conversions == SurfaceGroundConversions and isElectrifiedSurface(surfaceName) then
         local isNew = logIfChanged(characterGuid, "DWS_SACRED_LIGHTNING")
         applySurfaceEffect(characterGuid, "DWS_SACRED_LIGHTNING", isNew)
         return
     end
 
-    local sacred = SurfaceGroundConversions[tostring(surfaceName)]
-    if not sacred then
+    local effect = conversions[tostring(surfaceName)]
+    if not effect then
         noteUnmappedSurface(characterGuid, surfaceName)
         logIfChanged(characterGuid, nil)
         return
     end
 
-    local isNew = logIfChanged(characterGuid, sacred)
-    applySurfaceEffect(characterGuid, sacred, isNew)
+    local isNew = logIfChanged(characterGuid, effect)
+    applySurfaceEffect(characterGuid, effect, isNew)
 end
-
 -- Out-of-combat periodic heals (no turn events fire outside combat).
 local function oocHeals(guid)
     local key = guidKey(guid)
@@ -369,7 +378,7 @@ local function oocHeals(guid)
 end
 
 local function onStatusApplied(objectGuid, statusName, _, _)
-    if statusName == SACRED_MARK then
+    if statusName == SACRED_MARK or statusName == CURSED_MARK then
         markedCharacters[guidKey(objectGuid)] = objectGuid
         safe(function()
             if hasStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS_CD") then
@@ -401,7 +410,7 @@ local function onStatusApplied(objectGuid, statusName, _, _)
 end
 
 local function onStatusRemoved(objectGuid, statusName, _, _)
-    if statusName ~= SACRED_MARK then return end
+    if statusName ~= SACRED_MARK and statusName ~= CURSED_MARK then return end
 
     local key = guidKey(objectGuid)
     markedCharacters[key]    = nil
@@ -423,8 +432,10 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
 end
 
 local function onTurnStarted(characterGuid)
+    if not hasAnyZoneMark( characterGuid) then return end
     safe(function()
         pollAndApplySurface(characterGuid)
+        if not hasStatus(characterGuid,SACRED_MARK) then return end
 
         local key = guidKey(characterGuid)
         if currentSacredOf(characterGuid) == "DWS_SACRED_FIRE" then
@@ -441,15 +452,17 @@ local function onTurnStarted(characterGuid)
 end
 
 local function onTurnEnded(characterGuid)
+    if not hasAnyZoneMark(characterGuid) then return end
     safe(function()
+        if not hasStatus(characterGuid,SACRED_MARK) then return end
         if currentSacredOf(characterGuid) == "DWS_SACRED_CLEANSE_WATHER" then
             tryHeal(characterGuid, "water", HEAL_2D4)
         end
 
         for _, sacred in ipairs(ManagedSacred) do
             if hasStatus(characterGuid, sacred)
-               and not wasRefreshed(characterGuid, sacred)
-               and not PersistentSacred[sacred] then
+            and not wasRefreshed(characterGuid, sacred)
+            and not PersistentSacred[sacred] then
                 Osi.RemoveStatus(characterGuid, sacred)
             end
         end
@@ -476,14 +489,14 @@ local function surfacePollTick()
     pollCounter = pollCounter + 1
     safe(function()
         for key, guid in pairs(markedCharacters) do
-            if not hasStatus(guid, SACRED_MARK) then
+            if not hasAnyZoneMark(guid) then
                 markedCharacters[key]    = nil
                 lastLoggedSacred[key]    = nil
                 unmappedSurfaceSeen[key] = nil
                 lastHealMs[key]          = nil
             else
                 pollAndApplySurface(guid)
-                if not inCombat(guid) then
+                if not inCombat(guid) and hasStatus(guid,SACRED_MARK) then
                     oocHeals(guid)
                 end
             end

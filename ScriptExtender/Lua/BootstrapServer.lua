@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v19]"
+local MOD_TAG = "[DWS v20]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -8,16 +8,17 @@ local HEAL_1D4 = "DWS_SACRED_HEAL_1D4"
 local HEAL_2D4 = "DWS_SACRED_HEAL_2D4"
 
 -- 1 BG3 turn = 6s; poll = 2s -> 3 polls per turn
-local POLL_INTERVAL_MS  = 2000
-local POLLS_PER_TURN     = 3
-local SACRED_DURATION    = 6     -- managed surface buff, refreshed while standing
-local PERSIST_DURATION   = 18    -- poison resist / lightning: 3 turns, persists
-local POISON_TURNS       = 3     -- poison regen ticks
-local AGATHYS_DURATION   = 18    -- temp HP buff lasts 3 turns
-local AGATHYS_CD_POLLS   = 9     -- cannot re-grant for 3 turns after it expires
-local BLOODLUST_DURATION = 6
-local BLOOD_COOLDOWN     = 6
-local HEAL_GUARD_MS      = 5500  -- min real-time gap between heals of same kind
+local POLL_INTERVAL_MS    = 2000
+local POLLS_PER_TURN      = 3
+local SACRED_DURATION     = 6     -- managed surface buff, refreshed while standing
+local PERSIST_DURATION    = 18    -- poison resist / lightning: 3 turns, persists
+local POISON_TURNS        = 3     -- poison regen ticks
+local AGATHYS_DURATION    = 18    -- temp HP buff lasts 3 turns
+local AGATHYS_CD_POLLS    = 9     -- cannot re-grant for 3 turns after it expires
+local BLOODLUST_DURATION  = 6
+local BLOOD_COOLDOWN      = 6
+local HEAL_GUARD_MS       = 5500  -- min real-time gap between heals of same kind
+local EMPTY_POLLS_TO_LIVE = 2
 
 local SurfaceGroundConversions = {
     ["SurfaceFire"]               = "DWS_SACRED_FIRE",
@@ -58,7 +59,12 @@ local CursedSurfaceConversions = {
     ["SurfaceFireBlessed"]        = "DWS_CURSED_FIRE",
     ["SurfaceFireCursed"]         = "DWS_CURSED_FIRE",
     ["SurfaceHellfire"]           = "DWS_CURSED_FIRE",
+    ["SurfaceOil"]                = "DWS_CURSED_OIL",
+    ["SurfaceOilCloud"]           = "DWS_CURSED_OIL",
+    ["SurfaceGrease"]             = "DWS_CURSED_OIL",
+    ["SurfaceGreaseCloud"]        = "DWS_CURSED_OIL",
 }
+
 local SurfaceStatusTriggers = {
     ["BURNING"]        = "DWS_SACRED_FIRE",
     ["POISONED"]       = "DWS_SACRED_POISON",
@@ -82,6 +88,7 @@ local ManagedSacred = {
     "DWS_SACRED_ACID",
     "DWS_SACRED_BLOOD",
     "DWS_CURSED_FIRE",
+    "DWS_CURSED_OIL",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -97,6 +104,7 @@ local pollCounter           = 0
 local markedCharacters      = {}   -- key -> guid
 local refreshedThisTurn     = {}   -- key -> { sacred -> true }
 local lastLoggedSacred      = {}   -- key -> sacred|nil
+local emptySurfacePolls     = {}   -- key -> poll empty
 local unmappedSurfaceSeen   = {}   -- key -> { surface -> true }
 local lastHealMs            = {}   -- key -> { kind -> monotonicMs }
 local poisonHeal            = {}   -- key -> { guid=, turnsLeft=, pollAccum= }
@@ -143,6 +151,30 @@ local function markRefreshed(guid, sacred)
     local key = guidKey(guid)
     refreshedThisTurn[key] = refreshedThisTurn[key] or {}
     refreshedThisTurn[key][sacred] = true
+end
+
+local function logIfChanged(guid, sacred)
+    local key = guidKey(guid)
+    if lastLoggedSacred[key] == sacred then return false end
+    lastLoggedSacred[key] = sacred
+    if sacred then
+        Ext.Utils.Print(MOD_TAG .. " " .. key .. " on surface -> " .. sacred)
+    else
+        Ext.Utils.Print(MOD_TAG .. " " .. key .. " left mapped surface")
+    end
+    return true
+end
+
+local function noteMaybeLeftSurface(guid)
+    local key = guidKey(guid)
+    emptySurfacePolls[key] = (emptySurfacePolls[key] or 0) + 1
+    if emptySurfacePolls[key] >= EMPTY_POLLS_TO_LIVE then
+        logIfChanged(guid,nil)
+    end
+end
+
+local function notStillOnSurface(guid)
+    emptySurfacePolls[guidKey(guid)] = 0
 end
 
 local function wasRefreshed(guid, sacred)
@@ -286,18 +318,6 @@ local function maybeGrantIceAgathys(objectGuid)
     Ext.Utils.Print(MOD_TAG .. " ice agathys granted to " .. key)
 end
 
-local function logIfChanged(guid, sacred)
-    local key = guidKey(guid)
-    if lastLoggedSacred[key] == sacred then return false end
-    lastLoggedSacred[key] = sacred
-    if sacred then
-        Ext.Utils.Print(MOD_TAG .. " " .. key .. " on surface -> " .. sacred)
-    else
-        Ext.Utils.Print(MOD_TAG .. " " .. key .. " left mapped surface")
-    end
-    return true
-end
-
 local function noteUnmappedSurface(guid, surfaceName)
     local key = guidKey(guid)
     unmappedSurfaceSeen[key] = unmappedSurfaceSeen[key] or {}
@@ -319,6 +339,11 @@ local function applySurfaceEffect(guid, sacred, isNew)
         return
     end
 
+    if hasStatus(guid, sacred) then
+        markRefreshed(guid, sacred)
+        return
+    end
+
     applyStatus(guid, sacred, SACRED_DURATION)
     markRefreshed(guid, sacred)
 
@@ -335,11 +360,12 @@ local function pollAndApplySurface(characterGuid)
 
     local surfaceName = Osi.GetSurfaceGroundAt(characterGuid)
     if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
-        logIfChanged(characterGuid, nil)
+        noteMaybeLeftSurface(characterGuid)
         return
     end
 
     if conversions == SurfaceGroundConversions and isElectrifiedSurface(surfaceName) then
+        notStillOnSurface(characterGuid)
         local isNew = logIfChanged(characterGuid, "DWS_SACRED_LIGHTNING")
         applySurfaceEffect(characterGuid, "DWS_SACRED_LIGHTNING", isNew)
         return
@@ -348,13 +374,15 @@ local function pollAndApplySurface(characterGuid)
     local effect = conversions[tostring(surfaceName)]
     if not effect then
         noteUnmappedSurface(characterGuid, surfaceName)
-        logIfChanged(characterGuid, nil)
+        noteMaybeLeftSurface(characterGuid)
         return
     end
 
+    notStillOnSurface(characterGuid)
     local isNew = logIfChanged(characterGuid, effect)
     applySurfaceEffect(characterGuid, effect, isNew)
 end
+
 -- Out-of-combat periodic heals (no turn events fire outside combat).
 local function oocHeals(guid)
     local key = guidKey(guid)

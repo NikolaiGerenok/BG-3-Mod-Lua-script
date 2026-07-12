@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v20]"
+local MOD_TAG = "[DWS v22]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -63,6 +63,17 @@ local CursedSurfaceConversions = {
     ["SurfaceOilCloud"]           = "DWS_CURSED_OIL",
     ["SurfaceGrease"]             = "DWS_CURSED_OIL",
     ["SurfaceGreaseCloud"]        = "DWS_CURSED_OIL",
+    ["SurfaceIce"]                = "DWS_CURSED_ICE",
+    ["SurfaceIceThin"]            = "DWS_CURSED_ICE",
+    ["SurfaceIceCloud"]           = "DWS_CURSED_ICE",
+    ["SurfaceFrozen"]             = "DWS_CURSED_ICE",
+    ["SurfaceWaterFrozen"]        = "DWS_CURSED_ICE",
+    ["SurfaceWaterFrozenBlessed"] = "DWS_CURSED_ICE",
+    ["SurfaceWaterFrozenCursed"]  = "DWS_CURSED_ICE",
+    ["SurfacePoison"]             = "DWS_CURSED_POISON",
+    ["SurfacePoisonBlessed"]      = "DWS_CURSED_POISON",
+    ["SurfacePoisonCursed"]       = "DWS_CURSED_POISON",
+    ["SurfacePoisonCloud"]        = "DWS_CURSED_POISON"
 }
 
 local SurfaceStatusTriggers = {
@@ -89,6 +100,9 @@ local ManagedSacred = {
     "DWS_SACRED_BLOOD",
     "DWS_CURSED_FIRE",
     "DWS_CURSED_OIL",
+    "DWS_CURSED_ICE",
+    "DWS_CURSED_LIGHTNING",
+    "DWS_CURSED_POISON"
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -364,10 +378,13 @@ local function pollAndApplySurface(characterGuid)
         return
     end
 
-    if conversions == SurfaceGroundConversions and isElectrifiedSurface(surfaceName) then
+    if isElectrifiedSurface(surfaceName) then
         notStillOnSurface(characterGuid)
-        local isNew = logIfChanged(characterGuid, "DWS_SACRED_LIGHTNING")
-        applySurfaceEffect(characterGuid, "DWS_SACRED_LIGHTNING", isNew)
+        local lightning = (conversions == SurfaceGroundConversions) 
+            and "DWS_SACRED_LIGHTNING"
+            or "DWS_CURSED_LIGHTNING"
+        local isNew = logIfChanged(characterGuid, lightning)
+        applySurfaceEffect(characterGuid, lightning, isNew)
         return
     end
 

@@ -73,7 +73,19 @@ local CursedSurfaceConversions = {
     ["SurfacePoison"]             = "DWS_CURSED_POISON",
     ["SurfacePoisonBlessed"]      = "DWS_CURSED_POISON",
     ["SurfacePoisonCursed"]       = "DWS_CURSED_POISON",
-    ["SurfacePoisonCloud"]        = "DWS_CURSED_POISON"
+    ["SurfacePoisonCloud"]        = "DWS_CURSED_POISON",
+    ["SurfaceAcid"]               = "DWS_CURSED_ACID",
+    ["SurfaceAcidBlessed"]        = "DWS_CURSED_ACID",
+    ["SurfaceAcidCursed"]         = "DWS_CURSED_ACID",
+    ["SurfaceAcidCloud"]          = "DWS_CURSED_ACID",
+    ["SurfaceWater"]              = "DWS_CURSED_WATER",
+    ["SurfaceWaterBlessed"]       = "DWS_CURSED_WATER",
+    ["SurfaceWaterCursed"]        = "DWS_CURSED_WATER",
+    ["SurfaceWaterCloud"]         = "DWS_CURSED_WATER",
+    ["SurfaceBlood"]              = "DWS_CURSED_BLOOD",
+    ["SurfaceBloodSilver"]        = "DWS_CURSED_BLOOD",
+    ["SurfaceBloodElectrified"]   = "DWS_CURSED_BLOOD",
+    ["SurfaceBloodCloud"]         = "DWS_CURSED_BLOOD",
 }
 
 local SurfaceStatusTriggers = {
@@ -102,7 +114,9 @@ local ManagedSacred = {
     "DWS_CURSED_OIL",
     "DWS_CURSED_ICE",
     "DWS_CURSED_LIGHTNING",
-    "DWS_CURSED_POISON"
+    "DWS_CURSED_POISON",
+    "DWS_CURSED_WATER",
+    "DWS_CURSED_BLOOD",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -112,6 +126,7 @@ local PersistentSacred = {
     ["DWS_SACRED_ICE_AGATHYS"]  = true,
     ["DWS_SACRED_BLOOD_LUST"]   = true,
     ["DWS_SACRED_BLOOD_CD"]     = true,
+    ["DWS_CURSED_BLOOD_PULSE"]  = true,
 }
 
 local pollCounter           = 0
@@ -515,7 +530,7 @@ local function onTurnEnded(characterGuid)
     end)
 end
 
-local function onKilledBy(_, _, attacker, _)
+local function onKilledBy(victim, _, attacker, _)
     safe(function()
         if not attacker or attacker == "" then return end
         if not hasStatus(attacker, SACRED_MARK)        then return end
@@ -527,6 +542,20 @@ local function onKilledBy(_, _, attacker, _)
         markRefreshed(attacker, "DWS_SACRED_BLOOD_LUST")
         markRefreshed(attacker, "DWS_SACRED_BLOOD_CD")
         Ext.Utils.Print(MOD_TAG .. " bloodlust granted to " .. guidKey(attacker))
+    end)
+
+    safe(function()
+        if not victim or victim == "" then return end
+        if not hasStatus(victim, "DWS_CURSED_BLOOD") then return end
+        
+        for key, guid in pairs(markedCharacters) do
+            if guidKey(guid) ~= guidKey(victim)
+            and hasStatus(guid, CURSED_MARK) then
+
+                applyStatus(guid, "DWS_CURSED_BLOOD_PULSE", 1)
+                Ext.Utils.Print(MOD_TAG .. " blood pulse -> " .. guidKey(guid))
+            end
+        end
     end)
 end
 

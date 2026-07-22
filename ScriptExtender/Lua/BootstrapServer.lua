@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v22]"
+local MOD_TAG = "[DWS v23]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -88,6 +88,10 @@ local CursedSurfaceConversions = {
     ["SurfaceBloodCloud"]         = "DWS_CURSED_BLOOD",
 }
 
+local EnchantedConversions = {
+    ["DWS_CURSED_FIRE"] = {passive  = "DWS_ENH_CURSED_FIRE", enhanced = "DWS_CURSED_FIRE_ENH",}
+}
+
 local SurfaceStatusTriggers = {
     ["BURNING"]        = "DWS_SACRED_FIRE",
     ["POISONED"]       = "DWS_SACRED_POISON",
@@ -117,6 +121,7 @@ local ManagedSacred = {
     "DWS_CURSED_POISON",
     "DWS_CURSED_WATER",
     "DWS_CURSED_BLOOD",
+    "DWS_CURSED_FIRE_ENH",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -138,6 +143,7 @@ local unmappedSurfaceSeen   = {}   -- key -> { surface -> true }
 local lastHealMs            = {}   -- key -> { kind -> monotonicMs }
 local poisonHeal            = {}   -- key -> { guid=, turnsLeft=, pollAccum= }
 local agathysCdUntil        = {}   -- key -> pollCounter deadline
+local cursedBloodMarked     = {}   -- guidKey -> true, while standing in the cursed blood
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
 
@@ -146,6 +152,22 @@ local function guidKey(guid) return tostring(guid) end
 local function hasStatus(objectGuid, statusName)
     local r = Osi.HasActiveStatus(objectGuid, statusName)
     return r == 1 or r == true
+end
+
+local function hasPassive(guid,passiveName)
+    local r = Osi.HasPassive(guid,passiveName)
+    return r == 1 or r == true
+end
+
+local function previousEnchanced(guid,baseStatus)
+    local entry = EnchantedConversions[baseStatus]
+    if entry == nil then
+        return baseStatus
+    end
+    if hasPassive(guid, entry.passive) then
+        return entry.enhanced
+    end
+    return baseStatus
 end
 
 local function inCombat(guid)
@@ -359,22 +381,29 @@ end
 -- Apply the surface-specific buff while standing. Periodic heals are driven by
 -- turn events / the OOC poll, NOT here (fire only gets its instant entry tick).
 local function applySurfaceEffect(guid, sacred, isNew)
+    local status = previousEnchanced(guid, sacred)
+    
     if sacred == "DWS_SACRED_POISON" then
         startOrRefreshPoison(guid)
         return
     end
+
     if sacred == "DWS_SACRED_LIGHTNING" then
         applyElectrifiedLightning(guid, isNew)
         return
     end
 
-    if hasStatus(guid, sacred) then
-        markRefreshed(guid, sacred)
+    if hasStatus(guid, status) then
+        markRefreshed(guid, status)
         return
     end
 
-    applyStatus(guid, sacred, SACRED_DURATION)
-    markRefreshed(guid, sacred)
+    if sacred == "DWS_CURSED_BLOOD" then 
+        cursedBloodMarked[guidKey(guid)] = true 
+    end
+
+    applyStatus(guid, status, SACRED_DURATION)
+    markRefreshed(guid, status)
 
     if sacred == "DWS_SACRED_FIRE" then
         if isNew then tryHeal(guid, "fire", HEAL_1D4) end
@@ -525,12 +554,16 @@ local function onTurnEnded(characterGuid)
             and not PersistentSacred[sacred] then
                 Osi.RemoveStatus(characterGuid, sacred)
             end
+            if sacred == "DWS_CURSED_BLOOD" then
+                cursedBloodMarked[guidKey(characterGuid)] = nil
+            end
         end
         refreshedThisTurn[guidKey(characterGuid)] = nil
     end)
 end
 
 local function onKilledBy(victim, _, attacker, _)
+    Ext.Utils.Print(MOD_TAG .. " KilledBy fired victim=" .. guidKey(victim))
     safe(function()
         if not attacker or attacker == "" then return end
         if not hasStatus(attacker, SACRED_MARK)        then return end
@@ -546,8 +579,14 @@ local function onKilledBy(victim, _, attacker, _)
 
     safe(function()
         if not victim or victim == "" then return end
-        if not hasStatus(victim, "DWS_CURSED_BLOOD") then return end
+        local vKey = guidKey(victim)
+        if not cursedBloodMarked[vKey] then
+            Ext.Utils.Print(MOD_TAG .. "cursed blood skip (not in table)")
+            return
+        end
         
+        Ext.Utils.Print(MOD_TAG .. "cursed blood wave triggered")
+
         for key, guid in pairs(markedCharacters) do
             if guidKey(guid) ~= guidKey(victim)
             and hasStatus(guid, CURSED_MARK) then
@@ -556,6 +595,8 @@ local function onKilledBy(victim, _, attacker, _)
                 Ext.Utils.Print(MOD_TAG .. " blood pulse -> " .. guidKey(guid))
             end
         end
+    
+        cursedBloodMarked[vKey] = nil
     end)
 end
 

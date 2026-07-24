@@ -4,8 +4,10 @@ local MOD_TAG = "[DWS v23]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
-local HEAL_1D4 = "DWS_SACRED_HEAL_1D4"
-local HEAL_2D4 = "DWS_SACRED_HEAL_2D4"
+local HEAL_1D4    = "DWS_SACRED_HEAL_1D4"
+local HEAL_2D4    = "DWS_SACRED_HEAL_2D4"
+local AURA_CURSED = "DWS_CURSED_GROUND_ZONE_AURA"
+local AURA_SACRED = "DWS_SACRED_GROUND_ZONE_AURA"
 
 -- 1 BG3 turn = 6s; poll = 2s -> 3 polls per turn
 local POLL_INTERVAL_MS    = 2000
@@ -134,6 +136,15 @@ local PersistentSacred = {
     ["DWS_CURSED_BLOOD_PULSE"]  = true,
 }
 
+local DamageFormuls = {
+    ["DWS_CURSED_FIRE_ENH"] = {
+        damageType = "Fire",
+        dieSides = 4, 
+        baseDice = 1,
+        levelPerDie = 4,
+    }
+}
+
 local pollCounter           = 0
 local markedCharacters      = {}   -- key -> guid
 local refreshedThisTurn     = {}   -- key -> { sacred -> true }
@@ -144,10 +155,16 @@ local lastHealMs            = {}   -- key -> { kind -> monotonicMs }
 local poisonHeal            = {}   -- key -> { guid=, turnsLeft=, pollAccum= }
 local agathysCdUntil        = {}   -- key -> pollCounter deadline
 local cursedBloodMarked     = {}   -- guidKey -> true, while standing in the cursed blood
+local zoneOwner             = {}   -- victimKey -> casterGuid
+local auraCaster            = {}   -- summonKey -> playerGuid
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
 
-local function guidKey(guid) return tostring(guid) end
+local function guidKey(guid)
+    local s = tostring(guid or "")
+    local uuid = s:match("(%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")
+    return uuid or s
+end
 
 local function hasStatus(objectGuid, statusName)
     local r = Osi.HasActiveStatus(objectGuid, statusName)
@@ -164,7 +181,9 @@ local function previousEnchanced(guid,baseStatus)
     if entry == nil then
         return baseStatus
     end
-    if hasPassive(guid, entry.passive) then
+
+    local caster = zoneOwner[guidKey(guid)] or guid
+    if hasPassive(caster, entry.passive) then
         return entry.enhanced
     end
     return baseStatus
@@ -303,6 +322,18 @@ local function isCharacter(guid)
     local r
     pcall(function() r = Osi.IsCharacter(guid) end)
     return r == 1 or r == true
+end
+
+local function rollDice(count,sides)
+    local total = 0
+    for _ = 1, count do
+        total = total + Ext.Utils.Random(1,sides)
+    end
+    return total
+end
+
+local function diceCount(level,cfg)
+    return cfg.baseDice + math.floor(level / cfg.levelPerDie)
 end
 
 local function tryHeal(guid, kind, healStatus)
@@ -466,9 +497,18 @@ local function oocHeals(guid)
     end
 end
 
-local function onStatusApplied(objectGuid, statusName, _, _)
+local function onStatusApplied(objectGuid, statusName, causeGuid, _)
+    if statusName == AURA_CURSED or statusName == AURA_SACRED then
+        auraCaster[guidKey(objectGuid)] = causeGuid
+        Ext.Utils.Print(MOD_TAG .. " aura on " .. guidKey(objectGuid) .. " caster=" .. tostring(causeGuid))
+        return
+    end
+    
     if statusName == SACRED_MARK or statusName == CURSED_MARK then
+        local caster = auraCaster[guidKey(causeGuid)] or causeGuid
         markedCharacters[guidKey(objectGuid)] = objectGuid
+        zoneOwner[guidKey(objectGuid)] = caster
+        Ext.Utils.Print(MOD_TAG .. " mark on " .. guidKey(objectGuid) .. " zoneOwner=" .. tostring(caster))
         safe(function()
             if hasStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS_CD") then
                 Osi.RemoveStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS_CD")
@@ -507,6 +547,7 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
     lastLoggedSacred[key]    = nil
     unmappedSurfaceSeen[key] = nil
     lastHealMs[key]          = nil
+    zoneOwner[key] = nil
     -- poisonHeal / agathysCdUntil intentionally kept (persist after aura exit)
 
     safe(function()
@@ -522,6 +563,19 @@ end
 
 local function onTurnStarted(characterGuid)
     if not hasAnyZoneMark( characterGuid) then return end
+
+    local caster = zoneOwner[guidKey(characterGuid)] or characterGuid
+    local level = Osi.GetLevel(caster)   
+    local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
+    local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
+   
+
+    if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
+        local amount = rollDice(dice, cfg.dieSides)
+        Osi.ApplyDamage(characterGuid, amount, cfg.damageType, caster)
+        Ext.Utils.Print(MOD_TAG .. " fire ENH tick " .. tostring(dice) .. "d4 = " .. tostring(amount))
+    end
+
     safe(function()
         pollAndApplySurface(characterGuid)
         if not hasStatus(characterGuid,SACRED_MARK) then return end

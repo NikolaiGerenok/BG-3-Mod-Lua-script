@@ -91,7 +91,16 @@ local CursedSurfaceConversions = {
 }
 
 local EnchantedConversions = {
-    ["DWS_CURSED_FIRE"] = {passive  = "DWS_ENH_CURSED_FIRE", enhanced = "DWS_CURSED_FIRE_ENH",}
+    ["DWS_CURSED_FIRE"] = {
+        passive  = "DWS_ENH_CURSED_FIRE", 
+        enhanced = "DWS_CURSED_FIRE_ENH",
+    },
+    ["DWS_CURSED_ICE"]  = {
+        passive  = "DWS_ENH_CURSED_ICE",
+        enhanced = "DWS_CURSED_ICE_ENH",
+    },
+
+
 }
 
 local SurfaceStatusTriggers = {
@@ -124,6 +133,7 @@ local ManagedSacred = {
     "DWS_CURSED_WATER",
     "DWS_CURSED_BLOOD",
     "DWS_CURSED_FIRE_ENH",
+    "DWS_CURSED_ICE_ENH",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -568,16 +578,23 @@ local function onTurnStarted(characterGuid)
     local level = Osi.GetLevel(caster)   
     local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
     local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
-   
-
-    if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
-        local amount = rollDice(dice, cfg.dieSides)
-        Osi.ApplyDamage(characterGuid, amount, cfg.damageType, caster)
-        Ext.Utils.Print(MOD_TAG .. " fire ENH tick " .. tostring(dice) .. "d4 = " .. tostring(amount))
-    end
 
     safe(function()
         pollAndApplySurface(characterGuid)
+
+        if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
+            local amount = rollDice(dice, cfg.dieSides)
+            Osi.ApplyDamage(characterGuid, amount, cfg.damageType, caster)
+            Ext.Utils.Print(MOD_TAG .. " fire ENH tick " .. tostring(dice) .. "d4 = " .. tostring(amount))
+        end
+    
+        if hasStatus(characterGuid, "DWS_CURSED_ICE_ENH") then 
+            local stacks = 2 + math.floor(level / 6)
+                Osi.ApplyStatus(characterGuid, "DWS_CURSED_ICE_STACK", stacks * 6, 1, caster)
+                Ext.Utils.Print(MOD_TAG .. " ice ENH tick " .. tostring(stacks)
+                    .. " after=" .. tostring(hasStatus(characterGuid, "DWS_CURSED_ICE_STACK")))
+        end
+
         if not hasStatus(characterGuid,SACRED_MARK) then return end
 
         local key = guidKey(characterGuid)

@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v23]"
+local MOD_TAG = "[DWS v24]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -99,6 +99,10 @@ local EnchantedConversions = {
         passive  = "DWS_ENH_CURSED_ICE",
         enhanced = "DWS_CURSED_ICE_ENH",
     },
+    ["DWS_CURSED_POISON"] = {
+        passive  = "DWS_ENH_CURSED_POISON",
+        enhanced = "DWS_CURSED_POISON_ENH",
+    },
 
 
 }
@@ -134,6 +138,7 @@ local ManagedSacred = {
     "DWS_CURSED_BLOOD",
     "DWS_CURSED_FIRE_ENH",
     "DWS_CURSED_ICE_ENH",
+    "DWS_CURSED_POISON_ENH",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -147,12 +152,19 @@ local PersistentSacred = {
 }
 
 local DamageFormuls = {
-    ["DWS_CURSED_FIRE_ENH"] = {
+    ["DWS_CURSED_FIRE_ENH"]     = {
         damageType = "Fire",
         dieSides = 4, 
         baseDice = 1,
         levelPerDie = 4,
-    }
+    },
+
+    ["DWS_CURSED_ICE_STACK_ENH"] = {
+        dieSidesBase = 4,
+        dieSidesPerLevels = 4,
+        dieSidesStep = 2,
+        dieSidesMax = 8,
+    },
 }
 
 local pollCounter           = 0
@@ -167,6 +179,7 @@ local agathysCdUntil        = {}   -- key -> pollCounter deadline
 local cursedBloodMarked     = {}   -- guidKey -> true, while standing in the cursed blood
 local zoneOwner             = {}   -- victimKey -> casterGuid
 local auraCaster            = {}   -- summonKey -> playerGuid
+local poisonOwner           = {}   -- victimKey -> casterGuid
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
 
@@ -528,6 +541,12 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
         return
     end
 
+    if statusName == "DWS_CURSED_POISON_STACK_ENH" then
+        local key = guidKey(objectGuid)
+        poisonOwner[key] = zoneOwner[key] or poisonOwner[key] or causeGuid
+        return
+    end
+
     local sacred = SurfaceStatusTriggers[statusName]
     if not sacred then return end
 
@@ -549,6 +568,11 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
 end
 
 local function onStatusRemoved(objectGuid, statusName, _, _)
+    if statusName == "DWS_CURSED_POISON_STACK_ENH" then
+        poisonOwner[guidKey(objectGuid)] = nil
+        return
+    end
+
     if statusName ~= SACRED_MARK and statusName ~= CURSED_MARK then return end
 
     local key = guidKey(objectGuid)
@@ -612,6 +636,22 @@ local function onTurnStarted(characterGuid)
 end
 
 local function onTurnEnded(characterGuid)
+    if hasStatus(characterGuid,"DWS_CURSED_POISON_STACK_ENH") then
+        local stacks = Osi.GetStatusTurns(characterGuid, "DWS_CURSED_POISON_STACK_ENH") or 0
+            if stacks >= 1 and stacks <= 3 then
+            local key = guidKey(characterGuid)    
+            local caster = poisonOwner[key] or zoneOwner[key] or characterGuid
+            local level = Osi.GetLevel(caster) or 1
+
+            local diceCount = 4 - stacks
+            local sides = math.min(8, 4 + 2 * math.floor(level / 4))
+            local amount = rollDice(diceCount, sides)
+            Osi.ApplyDamage(characterGuid, amount, "Poison", caster)
+            Ext.Utils.Print(MOD_TAG .. "apply damage" .. amount .. " from " .. caster)
+    
+        end
+    end
+
     if not hasAnyZoneMark(characterGuid) then return end
     safe(function()
         if not hasStatus(characterGuid,SACRED_MARK) then return end

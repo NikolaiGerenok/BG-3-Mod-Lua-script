@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v24]"
+local MOD_TAG = "[DWS v25]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -103,8 +103,18 @@ local EnchantedConversions = {
         passive  = "DWS_ENH_CURSED_POISON",
         enhanced = "DWS_CURSED_POISON_ENH",
     },
-
-
+    ["DWS_CURSED_ACID"] = {
+        passive  = "DWS_ENH_CURSED_ACID",
+        enhanced = "DWS_CURSED_ACID_ENH",
+    },
+    ["DWS_CURSED_OIL"] = {
+        passive  = "DWS_ENH_CURSED_OIL",
+        enhanced = "DWS_CURSED_OIL_ENH"
+    },
+    ["DWS_CURSED_BLOOD"] = {
+        passive  = "DWS_ENH_CURSED_BLOOD",
+        enhanced = "DWS_CURSED_BLOOD_ENH",
+    },
 }
 
 local SurfaceStatusTriggers = {
@@ -139,6 +149,10 @@ local ManagedSacred = {
     "DWS_CURSED_FIRE_ENH",
     "DWS_CURSED_ICE_ENH",
     "DWS_CURSED_POISON_ENH",
+    "DWS_CURSED_ACID", 
+    "DWS_CURSED_ACID_ENH",
+    "DWS_CURSED_OIL_ENH",
+    "DWS_CURSED_BLOOD_ENH",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -159,13 +173,44 @@ local DamageFormuls = {
         levelPerDie = 4,
     },
 
-    ["DWS_CURSED_ICE_STACK_ENH"] = {
+    ["DWS_CURSED_POISON_STACK_ENH"] = {
+        damageType = "Poison",
+        maxStacks = 3,
         dieSidesBase = 4,
         dieSidesPerLevels = 4,
         dieSidesStep = 2,
         dieSidesMax = 8,
     },
+
+    ["DWS_CURSED_ACID"] = {
+        damageType = "Acid",
+        dieSides = 4,
+        baseDice = 1,
+        levelPerDie = 4,
+    },
+
+    ["DWS_CURSED_BLOOD_PULSE_ENH"] = {
+        damageType = "Necrotic",
+        dieSides = 6,
+        baseDice = 1,
+        levelPerDie = 4,
+        maxDice = 3,
+    },
 }
+
+local POISON_ENH_DEBUFFS = { "SLOW", "STINKING_CLOUD", "POISONED" }
+
+local POISON_ENH_BY_STACK = {
+    [3] = "SLOW",
+    [2] = "STINKING_CLOUD",
+    [1] = "POISONED",
+}
+
+local ACID_STACK_STATUS = "DWS_CURSED_ACID_STACK"
+local ACID_ONHIT_COOLDOWN_MS = 600
+local acidHitBusy = {}       -- swingKey / echoKey -> locked
+local acidHitLastMs = {}     -- swingKey -> last proc ms
+local acidHitLastAction = {} -- swingKey -> storyActionID
 
 local pollCounter           = 0
 local markedCharacters      = {}   -- key -> guid
@@ -280,7 +325,6 @@ local function isElectrifiedSurface(surfaceName)
     return tostring(surfaceName):find("Electrified", 1, true) ~= nil
 end
 
--- Mapped sacred status for the surface the character is currently standing on.
 local function currentSacredOf(guid)
     local surfaceName = Osi.GetSurfaceGroundAt(guid)
     if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
@@ -294,7 +338,43 @@ local function applyStatus(objectGuid, statusName, duration)
     Osi.ApplyStatus(objectGuid, statusName, duration, 1, objectGuid)
 end
 
--- DEFINITIVE check: does the GAME actually know our statuses (= stats in .pak)?
+local function readStatusStacks(objectGuid, statusName)
+    local turns = Osi.GetStatusTurns(objectGuid,statusName)
+    if type(turns) == "number" and turns >= 1 then
+        return math.floor(turns)
+    end
+    local life = Osi.GetStatusCurrentLifetime(objectGuid,statusName)
+    if type(life) == "number" and life > 0 then
+       return math.ceil(life / 6)
+    end
+    return 0
+end
+
+local function clearMappedStatuses(objectGuid,statussesBystack)
+    for _, statusName in pairs(statussesBystack) do
+        if hasStatus(objectGuid, statusName) then
+            Osi.RemoveStatus(objectGuid, statusName)
+        end
+    end
+end
+
+local function syncMappedStatuses(objectGuid,stackStatus,statussesBystack,effectDuration,debugName)
+
+    local stacks = readStatusStacks(objectGuid,stackStatus)
+    local wantedStatus = statussesBystack[stacks]
+    Ext.Utils.Print( MOD_TAG .. " " .. debugName .. " sync stacks=" .. tostring(stacks) .. " want=" .. tostring(wantedStatus))
+   
+    for _, statusName in ipairs(statussesBystack) do
+        if statusName ~= wantedStatus and hasStatus(objectGuid, statusName) then
+            Osi.RemoveStatus(objectGuid, statusName)
+        end
+    end
+
+    if  wantedStatus and not hasStatus(objectGuid, wantedStatus) then
+        applyStatus(objectGuid, wantedStatus, effectDuration)
+    end
+end
+
 local function verifyStatsLoaded()
     if not Ext or not Ext.Stats or not Ext.Stats.Get then
         Ext.Utils.Print(MOD_TAG .. " cannot verify stats (Ext.Stats unavailable)")
@@ -323,7 +403,6 @@ local function hpInfo(guid)
     return tostring(cur) .. "/" .. tostring(max)
 end
 
--- Best-effort dump of all active statuses (diagnostic for shock names).
 local function dumpStatuses(guid)
     local out = {}
     pcall(function()
@@ -339,8 +418,6 @@ local function dumpStatuses(guid)
     return table.concat(out, ", ")
 end
 
--- Apply an instant heal status, guarded so the same kind can't fire twice
--- within HEAL_GUARD_MS (prevents mid-turn spam / turn+poll overlap).
 local function isCharacter(guid)
     local r
     pcall(function() r = Osi.IsCharacter(guid) end)
@@ -432,8 +509,6 @@ local function noteUnmappedSurface(guid, surfaceName)
         tostring(surfaceName) .. "' under " .. key .. ")")
 end
 
--- Apply the surface-specific buff while standing. Periodic heals are driven by
--- turn events / the OOC poll, NOT here (fire only gets its instant entry tick).
 local function applySurfaceEffect(guid, sacred, isNew)
     local status = previousEnchanced(guid, sacred)
     
@@ -449,15 +524,35 @@ local function applySurfaceEffect(guid, sacred, isNew)
 
     if hasStatus(guid, status) then
         markRefreshed(guid, status)
+        if sacred == "DWS_CURSED_BLOOD" then
+            local key = guidKey(guid)
+            cursedBloodMarked[key] = {
+                enh = (status == "DWS_CURSED_BLOOD_ENH"),
+                caster = zoneOwner[key] or guid,
+            }
+        end
         return
     end
 
-    if sacred == "DWS_CURSED_BLOOD" then 
-        cursedBloodMarked[guidKey(guid)] = true 
+    if sacred == "DWS_CURSED_BLOOD" then
+        local key = guidKey(guid)
+        cursedBloodMarked[key] = {
+            enh = (status == "DWS_CURSED_BLOOD_ENH"),
+            caster = zoneOwner[key] or guid,
+        }
     end
 
     applyStatus(guid, status, SACRED_DURATION)
     markRefreshed(guid, status)
+
+    if status == "DWS_CURSED_OIL_ENH" and not hasStatus(guid, "DWS_CLUMSY") then
+        local caster = zoneOwner[guidKey(guid)] or guid
+        local level = Osi.GetLevel(caster) or 1
+        local stack = 2 + math.floor(level / 4)
+        Osi.ApplyStatus(guid, "DWS_CLUMSY", stack * 6, 1, caster)
+        Ext.Utils.Print(MOD_TAG .. " oil ENH -> CLUMSY turns=" .. tostring(stack)
+            .. " on " .. guidKey(guid))
+    end
 
     if sacred == "DWS_SACRED_FIRE" then
         if isNew then tryHeal(guid, "fire", HEAL_1D4) end
@@ -498,7 +593,6 @@ local function pollAndApplySurface(characterGuid)
     applySurfaceEffect(characterGuid, effect, isNew)
 end
 
--- Out-of-combat periodic heals (no turn events fire outside combat).
 local function oocHeals(guid)
     local key = guidKey(guid)
     local sacred = currentSacredOf(guid)
@@ -544,6 +638,36 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
     if statusName == "DWS_CURSED_POISON_STACK_ENH" then
         local key = guidKey(objectGuid)
         poisonOwner[key] = zoneOwner[key] or poisonOwner[key] or causeGuid
+        safe(function()
+            syncMappedStatuses(objectGuid,"DWS_CURSED_POISON_STACK_ENH",POISON_ENH_BY_STACK,6,"poison ENH")
+        end)
+        return
+    end
+
+    if statusName == "DWS_CURSED_POISON_ENH_HIT" then
+        safe(function()
+            Osi.RemoveStatus(objectGuid, "DWS_CURSED_POISON_ENH_HIT")
+            if not hasStatus(objectGuid, "DWS_CURSED_POISON_STACK_ENH") then return end
+            local stacks = readStatusStacks(objectGuid,"DWS_CURSED_POISON_STACK_ENH")
+            if stacks < 1 or stacks > 3 then
+                Ext.Utils.Print(MOD_TAG .. " poison ENH HIT skipped bad stacks=" .. tostring(stacks))
+                return
+            end
+
+            local cfg = DamageFormuls["DWS_CURSED_POISON_STACK_ENH"]
+            local key = guidKey(objectGuid)
+            local caster = poisonOwner[key] or zoneOwner[key] or objectGuid
+            local level = Osi.GetLevel(caster) or 1
+            local diceCount = cfg.maxStacks - stacks + 1
+            local sides = math.min(cfg.dieSidesMax, cfg.dieSidesBase + cfg.dieSidesStep * math.floor(level / cfg.dieSidesPerLevels))
+            local amount = rollDice(diceCount, sides)
+
+            Osi.ApplyDamage(objectGuid, amount, cfg.damageType, caster)
+            syncMappedStatuses(objectGuid,"DWS_CURSED_POISON_STACK_ENH",POISON_ENH_BY_STACK,6,"poison ENH")
+            Ext.Utils.Print(MOD_TAG .. " poison ENH fail hit "
+                .. tostring(diceCount) .. "d" .. tostring(sides)
+                .. "=" .. tostring(amount) .. " stacks=" .. tostring(stacks))
+        end)
         return
     end
 
@@ -570,6 +694,9 @@ end
 local function onStatusRemoved(objectGuid, statusName, _, _)
     if statusName == "DWS_CURSED_POISON_STACK_ENH" then
         poisonOwner[guidKey(objectGuid)] = nil
+        safe(function()
+            clearMappedStatuses(objectGuid, POISON_ENH_BY_STACK)
+        end)
         return
     end
 
@@ -582,7 +709,6 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
     unmappedSurfaceSeen[key] = nil
     lastHealMs[key]          = nil
     zoneOwner[key] = nil
-    -- poisonHeal / agathysCdUntil intentionally kept (persist after aura exit)
 
     safe(function()
         for _, sacred in ipairs(ManagedSacred) do
@@ -599,12 +725,20 @@ local function onTurnStarted(characterGuid)
     if not hasAnyZoneMark( characterGuid) then return end
 
     local caster = zoneOwner[guidKey(characterGuid)] or characterGuid
-    local level = Osi.GetLevel(caster)   
+    local level = Osi.GetLevel(caster)
     local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
+    local cursedAcidCfg = DamageFormuls["DWS_CURSED_ACID"]
     local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
+    local cursedAcidDice = cursedAcidCfg.baseDice + math.floor(level / cursedAcidCfg.levelPerDie)
 
     safe(function()
         pollAndApplySurface(characterGuid)
+        if hasStatus(characterGuid,"DWS_CURSED_ACID_ENH") then
+            local amount = rollDice(cursedAcidDice,cursedAcidCfg.dieSides)
+            Osi.ApplyDamage(characterGuid,amount,cursedAcidCfg.damageType,caster)
+            Ext.Utils.Print(MOD_TAG .. " acid ENH tick " .. tostring(cursedAcidDice)
+                .. "d" .. tostring(cursedAcidCfg.dieSides) .. "=" .. tostring(amount))
+        end
 
         if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
             local amount = rollDice(dice, cfg.dieSides)
@@ -619,6 +753,13 @@ local function onTurnStarted(characterGuid)
                     .. " after=" .. tostring(hasStatus(characterGuid, "DWS_CURSED_ICE_STACK")))
         end
 
+        if hasStatus(characterGuid,"DWS_CURSED_OIL_ENH") and not hasStatus(characterGuid,"DWS_CLUMSY") then
+            local stack = 2 + math.floor(level / 4)
+            Osi.ApplyStatus(characterGuid, "DWS_CLUMSY", stack * 6, 1, caster)
+            Ext.Utils.Print(MOD_TAG .. " oil ENH turn -> CLUMSY turns=" .. tostring(stack)
+                .. " on " .. guidKey(characterGuid))
+        end
+    
         if not hasStatus(characterGuid,SACRED_MARK) then return end
 
         local key = guidKey(characterGuid)
@@ -635,23 +776,57 @@ local function onTurnStarted(characterGuid)
     end)
 end
 
-local function onTurnEnded(characterGuid)
-    if hasStatus(characterGuid,"DWS_CURSED_POISON_STACK_ENH") then
-        local stacks = Osi.GetStatusTurns(characterGuid, "DWS_CURSED_POISON_STACK_ENH") or 0
-            if stacks >= 1 and stacks <= 3 then
-            local key = guidKey(characterGuid)    
-            local caster = poisonOwner[key] or zoneOwner[key] or characterGuid
-            local level = Osi.GetLevel(caster) or 1
+local function onAttackedBy(defender, attackerOwner, attacker, damageType, damageAmount, _damageCause, storyActionID)
+    if type(damageAmount) == "number" and damageAmount <= 0 then return end
+    if damageType == "Acid" then return end
 
-            local diceCount = 4 - stacks
-            local sides = math.min(8, 4 + 2 * math.floor(level / 4))
-            local amount = rollDice(diceCount, sides)
-            Osi.ApplyDamage(characterGuid, amount, "Poison", caster)
-            Ext.Utils.Print(MOD_TAG .. "apply damage" .. amount .. " from " .. caster)
-    
-        end
+    local dKey = guidKey(defender)
+    local aGuid = attacker
+    if not aGuid or aGuid == "" then aGuid = attackerOwner end
+    local aKey = guidKey(aGuid)
+    local sKey = aKey .. ">" .. dKey
+    local echoKey = "echo:" .. dKey
+
+    if acidHitBusy[sKey] or acidHitBusy[echoKey] then return end
+
+    local now = Ext.Utils.MonotonicTime()
+    if acidHitLastMs[sKey] and (now - acidHitLastMs[sKey]) < ACID_ONHIT_COOLDOWN_MS then return end
+    if storyActionID ~= nil and acidHitLastAction[sKey] == storyActionID then return end
+
+    if not hasStatus(defender, ACID_STACK_STATUS) then return end
+    if readStatusStacks(defender, ACID_STACK_STATUS) < 1 then return end
+
+    local source = aGuid
+    if not source or source == "" then
+        source = zoneOwner[dKey] or defender
+    end
+    local caster = zoneOwner[dKey] or source
+    local cfg = DamageFormuls["DWS_CURSED_ACID"]
+    local level = Osi.GetLevel(caster) or 1
+    local dice = diceCount(level, cfg)
+
+    acidHitBusy[sKey] = true
+    acidHitBusy[echoKey] = true
+    acidHitLastMs[sKey] = now
+    if storyActionID ~= nil then
+        acidHitLastAction[sKey] = storyActionID
     end
 
+    local amount = rollDice(dice, cfg.dieSides)
+    pcall(function()
+        Osi.ApplyDamage(defender, amount, cfg.damageType, source)
+    end)
+    Ext.Utils.Print(MOD_TAG .. " acid STACK on-hit lvl=" .. tostring(level)
+        .. " " .. tostring(dice) .. "d" .. tostring(cfg.dieSides)
+        .. "=" .. tostring(amount) .. " on " .. dKey)
+
+    Ext.Timer.WaitFor(ACID_ONHIT_COOLDOWN_MS, function()
+        acidHitBusy[sKey] = nil
+        acidHitBusy[echoKey] = nil
+    end)
+end
+
+local function onTurnEnded(characterGuid)
     if not hasAnyZoneMark(characterGuid) then return end
     safe(function()
         if not hasStatus(characterGuid,SACRED_MARK) then return end
@@ -691,22 +866,36 @@ local function onKilledBy(victim, _, attacker, _)
     safe(function()
         if not victim or victim == "" then return end
         local vKey = guidKey(victim)
-        if not cursedBloodMarked[vKey] then
+        local markInfo = cursedBloodMarked[vKey]
+        if not markInfo then
             Ext.Utils.Print(MOD_TAG .. "cursed blood skip (not in table)")
             return
         end
-        
-        Ext.Utils.Print(MOD_TAG .. "cursed blood wave triggered")
+
+        local enh = type(markInfo) == "table" and markInfo.enh
+        local caster = (type(markInfo) == "table" and markInfo.caster) or victim
+        Ext.Utils.Print(MOD_TAG .. "cursed blood wave triggered enh=" .. tostring(enh))
 
         for key, guid in pairs(markedCharacters) do
-            if guidKey(guid) ~= guidKey(victim)
-            and hasStatus(guid, CURSED_MARK) then
-
-                applyStatus(guid, "DWS_CURSED_BLOOD_PULSE", 1)
-                Ext.Utils.Print(MOD_TAG .. " blood pulse -> " .. guidKey(guid))
+            if guidKey(guid) ~= vKey and hasStatus(guid, CURSED_MARK) then
+                if enh then
+                    local cfg = DamageFormuls["DWS_CURSED_BLOOD_PULSE_ENH"]
+                    local level = Osi.GetLevel(caster) or 1
+                    local dice = math.min(cfg.maxDice, cfg.baseDice + math.floor(level / cfg.levelPerDie))
+                    local amount = rollDice(dice, cfg.dieSides)
+                    Osi.ApplyDamage(guid, amount, cfg.damageType, caster)
+                    Osi.ApplyStatus(guid, "BLEEDING", 12, 1, caster)
+                    Osi.ApplyStatus(guid, "BANE", 12, 1, caster)
+                    Ext.Utils.Print(MOD_TAG .. " blood pulse ENH "
+                        .. tostring(dice) .. "d6=" .. tostring(amount)
+                        .. " +bleed+bane -> " .. guidKey(guid))
+                else
+                    applyStatus(guid, "DWS_CURSED_BLOOD_PULSE", 1)
+                    Ext.Utils.Print(MOD_TAG .. " blood pulse -> " .. guidKey(guid))
+                end
             end
         end
-    
+
         cursedBloodMarked[vKey] = nil
     end)
 end
@@ -737,6 +926,7 @@ local function installListeners()
     Ext.Osiris.RegisterListener("TurnStarted",   1, "after", onTurnStarted)
     Ext.Osiris.RegisterListener("TurnEnded",     1, "after", onTurnEnded)
     Ext.Osiris.RegisterListener("KilledBy",      4, "after", onKilledBy)
+    Ext.Osiris.RegisterListener("AttackedBy",    7, "after", onAttackedBy)
     Ext.Utils.Print(MOD_TAG .. " Osiris listeners installed")
 end
 

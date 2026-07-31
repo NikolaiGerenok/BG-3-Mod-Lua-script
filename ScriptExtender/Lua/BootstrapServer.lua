@@ -10,17 +10,18 @@ local AURA_CURSED = "DWS_CURSED_GROUND_ZONE_AURA"
 local AURA_SACRED = "DWS_SACRED_GROUND_ZONE_AURA"
 
 -- 1 BG3 turn = 6s; poll = 2s -> 3 polls per turn
-local POLL_INTERVAL_MS    = 2000
-local POLLS_PER_TURN      = 3
-local SACRED_DURATION     = 6     -- managed surface buff, refreshed while standing
-local PERSIST_DURATION    = 18    -- poison resist / lightning: 3 turns, persists
-local POISON_TURNS        = 3     -- poison regen ticks
-local AGATHYS_DURATION    = 18    -- temp HP buff lasts 3 turns
-local AGATHYS_CD_POLLS    = 9     -- cannot re-grant for 3 turns after it expires
-local BLOODLUST_DURATION  = 6
-local BLOOD_COOLDOWN      = 6
-local HEAL_GUARD_MS       = 5500  -- min real-time gap between heals of same kind
-local EMPTY_POLLS_TO_LIVE = 2
+local POLL_INTERVAL_MS     = 2000
+local POLLS_PER_TURN       = 3
+local SACRED_DURATION      = 6     -- managed surface buff, refreshed while standing
+local PERSIST_DURATION     = 18    -- poison resist / lightning: 3 turns, persists
+local POISON_TURNS         = 3     -- poison regen ticks
+local AGATHYS_DURATION     = 18    -- temp HP buff lasts 3 turns
+local AGATHYS_CD_POLLS     = 9     -- cannot re-grant for 3 turns after it expires
+local BLOODLUST_DURATION   = 6
+local BLOOD_COOLDOWN       = 6
+local HEAL_GUARD_MS        = 5500  -- min real-time gap between heals of same kind
+local EMPTY_POLLS_TO_LIVE  = 2
+local BATTERY_CHARGE_CD_MS = 600
 
 local SurfaceGroundConversions = {
     ["SurfaceFire"]               = "DWS_SACRED_FIRE",
@@ -115,14 +116,22 @@ local EnchantedConversions = {
         passive  = "DWS_ENH_CURSED_BLOOD",
         enhanced = "DWS_CURSED_BLOOD_ENH",
     },
+    ["DWS_CURSED_WATER"] = {
+        passive  = "DWS_ENH_CURSED_WATER",
+        enhanced = "DWS_CURSED_WATER_ENH",
+    },
+    ["DWS_CURSED_LIGHTNING"] = {
+        passive  = "DWS_ENH_CURSED_LIGHTNING",
+        enhanced = "DWS_CURSED_LIGHTNING_ENH",
+    },
 }
 
 local SurfaceStatusTriggers = {
-    ["BURNING"]        = "DWS_SACRED_FIRE",
-    ["POISONED"]       = "DWS_SACRED_POISON",
-    ["WET"]            = "DWS_SACRED_CLEANSE_WATHER",
-    ["SHOCKED"]        = "DWS_SACRED_LIGHTNING",
-    ["ELECTROCUTED"]   = "DWS_SACRED_LIGHTNING",
+    ["BURNING"]         = "DWS_SACRED_FIRE",
+    ["POISONED"]        = "DWS_SACRED_POISON",
+    ["WET"]             = "DWS_SACRED_CLEANSE_WATHER",
+    ["SHOCKED"]         = "DWS_SACRED_LIGHTNING",
+    ["ELECTROCUTED"]    = "DWS_SACRED_LIGHTNING",
     ["SHOCKED_SURFACE"] = "DWS_SACRED_LIGHTNING",
 }
 
@@ -153,6 +162,8 @@ local ManagedSacred = {
     "DWS_CURSED_ACID_ENH",
     "DWS_CURSED_OIL_ENH",
     "DWS_CURSED_BLOOD_ENH",
+    "DWS_CURSED_WATER_ENH",
+    "DWS_CURSED_LIGHTNING_ENH",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -196,6 +207,23 @@ local DamageFormuls = {
         levelPerDie = 4,
         maxDice = 3,
     },
+
+    ["DWS_CURSED_WATER_ENH"] = {
+        damageType = "Necrotic",
+        dieSides = 6,
+        baseDice = 1,
+        levelPerDie = 4,
+        maxDice = 3,
+    },
+
+    ["DWS_CURSED_LIGHTNING_ENH"] = {
+        damageType = "Lightning",
+        dieSides = 4, 
+        baseDice = 1,
+        levelPerDie = 4,
+        maxDice = 3,
+    },
+
 }
 
 local POISON_ENH_DEBUFFS = { "SLOW", "STINKING_CLOUD", "POISONED" }
@@ -211,6 +239,7 @@ local ACID_ONHIT_COOLDOWN_MS = 600
 local acidHitBusy = {}       -- swingKey / echoKey -> locked
 local acidHitLastMs = {}     -- swingKey -> last proc ms
 local acidHitLastAction = {} -- swingKey -> storyActionID
+local batteryChargeLastMs = {}  -- dKey -> last ms
 
 local pollCounter           = 0
 local markedCharacters      = {}   -- key -> guid
@@ -460,6 +489,32 @@ local function stripShockStatuses(objectGuid)
     for _, s in ipairs(SHOCK_STATUS_NAMES) do
         if hasStatus(objectGuid, s) then Osi.RemoveStatus(objectGuid, s) end
     end
+end
+
+local function tryBattaryCharge(defender,damageType,damageAmount)
+    if damageType ~= "Lightning" then return end
+    if type(damageAmount) == "number" and damageAmount <= 0 then return end
+    if hasStatus(defender,"DWS_CURSED_BATTERY_CD") then return end
+    if not hasStatus(defender,"DWS_CURSED_BATTERY") and not hasStatus(defender,"DWS_CURSED_LIGHTNING_ENH") then return end
+    local dKey = guidKey(defender)
+    local now = Ext.Utils.MonotonicTime()
+    local caster = zoneOwner[dKey] or defender
+    if batteryChargeLastMs[dKey] and (now - batteryChargeLastMs[dKey]) < BATTERY_CHARGE_CD_MS then
+        return
+    end
+    batteryChargeLastMs[dKey] = now
+
+    local stack = readStatusStacks(defender,"DWS_CURSED_BATTERY")
+    stack = stack + 1
+    if stack >= 5 then
+        Osi.RemoveStatus(defender,"DWS_CURSED_BATTERY")
+        Osi.ApplyStatus(defender,"STUNNED",6,1,caster)
+        Osi.ApplyStatus(defender,"DWS_CURSED_BATTERY_CD",12,1,caster)
+        Ext.Utils.Print(MOD_TAG .. " battery OVERLOAD stun+CD on " .. dKey)
+        return
+    end
+    Osi.ApplyStatus(defender,"DWS_CURSED_BATTERY",stack * 6,1,caster)
+    Ext.Utils.Print(MOD_TAG .. " battery charge=" .. tostring(stack) .. " on " .. dKey)
 end
 
 local function applyElectrifiedLightning(objectGuid, isNew)
@@ -724,16 +779,15 @@ end
 local function onTurnStarted(characterGuid)
     if not hasAnyZoneMark( characterGuid) then return end
 
-    local caster = zoneOwner[guidKey(characterGuid)] or characterGuid
-    local level = Osi.GetLevel(caster)
-    local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
-    local cursedAcidCfg = DamageFormuls["DWS_CURSED_ACID"]
-    local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
-    local cursedAcidDice = cursedAcidCfg.baseDice + math.floor(level / cursedAcidCfg.levelPerDie)
-
     safe(function()
+        local caster = zoneOwner[guidKey(characterGuid)] or characterGuid
+        local level = Osi.GetLevel(caster) or 1
+        local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
+        local cursedAcidDice = cursedAcidCfg.baseDice + math.floor(level / cursedAcidCfg.levelPerDie)
+
         pollAndApplySurface(characterGuid)
         if hasStatus(characterGuid,"DWS_CURSED_ACID_ENH") then
+            local cursedAcidCfg = DamageFormuls["DWS_CURSED_ACID"]
             local amount = rollDice(cursedAcidDice,cursedAcidCfg.dieSides)
             Osi.ApplyDamage(characterGuid,amount,cursedAcidCfg.damageType,caster)
             Ext.Utils.Print(MOD_TAG .. " acid ENH tick " .. tostring(cursedAcidDice)
@@ -741,9 +795,20 @@ local function onTurnStarted(characterGuid)
         end
 
         if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
+            local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
             local amount = rollDice(dice, cfg.dieSides)
             Osi.ApplyDamage(characterGuid, amount, cfg.damageType, caster)
             Ext.Utils.Print(MOD_TAG .. " fire ENH tick " .. tostring(dice) .. "d4 = " .. tostring(amount))
+        end
+
+        if hasStatus(characterGuid, "DWS_CURSED_WATER_ENH") then
+            local waterCfg = DamageFormuls["DWS_CURSED_WATER_ENH"]
+            local waterDice = math.min(waterCfg.maxDice, waterCfg.baseDice + math.floor(level / waterCfg.levelPerDie))
+            local amount = rollDice(waterDice, waterCfg.dieSides)
+            Osi.ApplyDamage(characterGuid, amount, waterCfg.damageType, caster)
+            Ext.Utils.Print(MOD_TAG .. " water ENH tick " .. tostring(waterDice)
+                .. "d6=" .. tostring(amount)
+                .. " lvl=" .. tostring(level) .. " caster=" .. guidKey(caster))
         end
     
         if hasStatus(characterGuid, "DWS_CURSED_ICE_ENH") then 
@@ -759,6 +824,16 @@ local function onTurnStarted(characterGuid)
             Ext.Utils.Print(MOD_TAG .. " oil ENH turn -> CLUMSY turns=" .. tostring(stack)
                 .. " on " .. guidKey(characterGuid))
         end
+
+        if hasStatus(characterGuid,"DWS_CURSED_LIGHTNING_ENH") then
+            local LightningCfg = DamageFormuls["DWS_CURSED_LIGHTNING_ENH"]
+            local boltDice = math.min(LightningCfg.maxDice, LightningCfg.baseDice + math.floor(level / LightningCfg.levelPerDie))
+            local amount = rollDice(boltDice, LightningCfg.dieSides)
+            Osi.ApplyDamage(characterGuid, amount, LightningCfg.damageType, caster)
+            Ext.Utils.Print(MOD_TAG .. " lightning ENH tick " .. tostring(boltDice)
+                .. "d4=" .. tostring(amount))
+        end
+
     
         if not hasStatus(characterGuid,SACRED_MARK) then return end
 
@@ -778,7 +853,11 @@ end
 
 local function onAttackedBy(defender, attackerOwner, attacker, damageType, damageAmount, _damageCause, storyActionID)
     if type(damageAmount) == "number" and damageAmount <= 0 then return end
+
+    tryBattaryCharge(defender, damageType, damageAmount)
+
     if damageType == "Acid" then return end
+    if damageType == "Lightning" then return end
 
     local dKey = guidKey(defender)
     local aGuid = attacker

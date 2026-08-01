@@ -92,6 +92,18 @@ local CursedSurfaceConversions = {
 }
 
 local EnchantedConversions = {
+    ["DWS_SACRED_FIRE"] = {
+        passive  = "DWS_ENH_SACRED_FIRE",
+        enhanced = "DWS_SACRED_FIRE_ENH",
+    },
+    ["DWS_SACRED_OIL"] = {
+        passive  = "DWS_ENH_SACRED_OIL",
+        enhanced = "DWS_SACRED_OIL_ENH",
+    },
+    ["DWS_SACRED_ICE"] = {
+        passive  = "DWS_ENH_SACRED_ICE",
+        enhanced = "DWS_SACRED_ICE_ENH",
+    },
     ["DWS_CURSED_FIRE"] = {
         passive  = "DWS_ENH_CURSED_FIRE", 
         enhanced = "DWS_CURSED_FIRE_ENH",
@@ -143,9 +155,21 @@ local SHOCK_STATUS_NAMES = {
 -- Stripped when leaving the aura / at turn end if not refreshed this turn.
 local ManagedSacred = {
     "DWS_SACRED_FIRE",
+    "DWS_SACRED_FIRE_ENH",
+    "DWS_SACRED_FIRE_CLOAK_1",
+    "DWS_SACRED_FIRE_CLOAK_2",
+    "DWS_SACRED_FIRE_CLOAK_3",
     "DWS_SACRED_CLEANSE_WATHER",
     "DWS_SACRED_OIL",
+    "DWS_SACRED_OIL_ENH",
+    "DWS_SACRED_OIL_BASTION_1",
+    "DWS_SACRED_OIL_BASTION_2",
+    "DWS_SACRED_OIL_BASTION_3",
+    "DWS_SACRED_OIL_BASTION_4",
+    "DWS_SACRED_OIL_BASTION_5",
+    "DWS_SACRED_OIL_BASTION_6",
     "DWS_SACRED_ICE",
+    "DWS_SACRED_ICE_ENH",
     "DWS_SACRED_ACID",
     "DWS_SACRED_BLOOD",
     "DWS_CURSED_FIRE",
@@ -168,12 +192,16 @@ local ManagedSacred = {
 
 -- Never auto-stripped; rely on their own duration.
 local PersistentSacred = {
-    ["DWS_SACRED_POISON"]       = true,
-    ["DWS_SACRED_LIGHTNING"]    = true,
-    ["DWS_SACRED_ICE_AGATHYS"]  = true,
-    ["DWS_SACRED_BLOOD_LUST"]   = true,
-    ["DWS_SACRED_BLOOD_CD"]     = true,
-    ["DWS_CURSED_BLOOD_PULSE"]  = true,
+    ["DWS_SACRED_POISON"]         = true,
+    ["DWS_SACRED_LIGHTNING"]      = true,
+    ["DWS_SACRED_ICE_AGATHYS"]    = true,
+    ["DWS_SACRED_ICE_AGATHYS_1"]  = true,
+    ["DWS_SACRED_ICE_AGATHYS_2"]  = true,
+    ["DWS_SACRED_ICE_AGATHYS_3"]  = true,
+    ["DWS_SACRED_ICE_AGATHYS_4"]  = true,
+    ["DWS_SACRED_BLOOD_LUST"]     = true,
+    ["DWS_SACRED_BLOOD_CD"]       = true,
+    ["DWS_CURSED_BLOOD_PULSE"]    = true,
 }
 
 local DamageFormuls = {
@@ -232,6 +260,28 @@ local POISON_ENH_BY_STACK = {
     [3] = "SLOW",
     [2] = "STINKING_CLOUD",
     [1] = "POISONED",
+}
+
+local FIRE_CLOAKS = {
+    "DWS_SACRED_FIRE_CLOAK_1",
+    "DWS_SACRED_FIRE_CLOAK_2",
+    "DWS_SACRED_FIRE_CLOAK_3",
+}
+
+local OIL_BASTIONS = {
+  [1] = "DWS_SACRED_OIL_BASTION_1",
+  [2] = "DWS_SACRED_OIL_BASTION_2",
+  [3] = "DWS_SACRED_OIL_BASTION_3",
+  [4] = "DWS_SACRED_OIL_BASTION_4",
+  [5] = "DWS_SACRED_OIL_BASTION_5",
+  [6] = "DWS_SACRED_OIL_BASTION_6",
+}
+
+local ICE_AGATHYS = {
+    "DWS_SACRED_ICE_AGATHYS_1",
+    "DWS_SACRED_ICE_AGATHYS_2",
+    "DWS_SACRED_ICE_AGATHYS_3",
+    "DWS_SACRED_ICE_AGATHYS_4",
 }
 
 local ACID_STACK_STATUS = "DWS_CURSED_ACID_STACK"
@@ -411,6 +461,7 @@ local function verifyStatsLoaded()
     end
     local required = {
         HEAL_1D4, HEAL_2D4, "DWS_SACRED_FIRE",
+        "DWS_SACRED_FIRE_CLOAK_1", "DWS_SACRED_FIRE_CLOAK_2", "DWS_SACRED_FIRE_CLOAK_3",
         "DWS_SACRED_LIGHTNING", "DWS_SACRED_OIL", "DWS_SACRED_ICE",
     }
     for _, name in ipairs(required) do
@@ -545,14 +596,119 @@ local function startOrRefreshPoison(objectGuid)
     end
 end
 
+local function sacredFireCloakForLevel(level)
+    local tier = math.min(3, 1 + math.floor((level or 1) / 6))
+    return FIRE_CLOAKS[tier]
+end
+
+local function sacredOilBastionForLevel(level)
+    local tier = math.min(6, math.max(1, math.ceil((level or 1) / 2)))
+    return OIL_BASTIONS[tier]
+end
+
+local function sacredIceAgathysForLevel(level)
+    local tier = math.min(4, math.max(1, math.ceil((level or 1) / 3)))
+    return ICE_AGATHYS[tier]
+end
+
+local SACRED_TIER_EFFECTS = {
+    ["DWS_SACRED_FIRE"] = {
+        enhanced = "DWS_SACRED_FIRE_ENH",
+        tiers = FIRE_CLOAKS,
+        statusForLevel = sacredFireCloakForLevel,
+        duration = 12,
+        logTag = "sacred fire cloak",
+    },
+    ["DWS_SACRED_OIL"] = {
+        enhanced = "DWS_SACRED_OIL_ENH",
+        tiers = OIL_BASTIONS,
+        statusForLevel = sacredOilBastionForLevel,
+        duration = SACRED_DURATION,
+        logTag = "sacred oil bastion",
+    },
+}
+
+local function clearTierStatuses(guid, tiers)
+    for _, name in ipairs(tiers) do
+        if hasStatus(guid, name) then
+            Osi.RemoveStatus(guid, name)
+        end
+    end
+end
+
+local function applySacredTierStatus(guid, tiers, statusForLevel, duration, logTag)
+    local caster = zoneOwner[guidKey(guid)] or guid
+    local level = Osi.GetLevel(caster) or 1
+    local want = statusForLevel(level)
+
+    for _, name in ipairs(tiers) do
+        if name ~= want and hasStatus(guid, name) then
+            Osi.RemoveStatus(guid, name)
+        end
+    end
+
+    if hasStatus(guid, want) then
+        markRefreshed(guid, want)
+    else
+        applyStatus(guid, want, duration)
+        markRefreshed(guid, want)
+        Ext.Utils.Print(MOD_TAG .. " " .. logTag .. " -> " .. want
+            .. " lvl=" .. tostring(level) .. " on " .. guidKey(guid))
+    end
+end
+
+local function refreshSacredTierEffect(guid, sacred, status)
+    local cfg = SACRED_TIER_EFFECTS[sacred]
+    if not cfg then return end
+
+    if status == cfg.enhanced then
+        applySacredTierStatus(
+            guid,
+            cfg.tiers,
+            cfg.statusForLevel,
+            cfg.duration,
+            cfg.logTag
+        )
+    else
+        clearTierStatuses(guid, cfg.tiers)
+    end
+end
+
+local function hasAnyIceAgathys(guid)
+    if hasStatus(guid, "DWS_SACRED_ICE_AGATHYS") then return true end
+    for _, name in ipairs(ICE_AGATHYS) do
+        if hasStatus(guid, name) then return true end
+    end
+    return false
+end
+
+local function clearIceAgathys(guid)
+    if hasStatus(guid, "DWS_SACRED_ICE_AGATHYS") then
+        Osi.RemoveStatus(guid, "DWS_SACRED_ICE_AGATHYS")
+    end
+    clearTierStatuses(guid, ICE_AGATHYS)
+end
+
 local function maybeGrantIceAgathys(objectGuid)
     local key = guidKey(objectGuid)
-    if hasStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS") then return end   -- still active, don't stack/spam
-    if pollCounter < (agathysCdUntil[key] or 0) then return end
-    applyStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS", AGATHYS_DURATION)
+    local enh = hasStatus(objectGuid, "DWS_SACRED_ICE_ENH")
+    local want = enh
+        and sacredIceAgathysForLevel(Osi.GetLevel(zoneOwner[key] or objectGuid) or 1)
+        or "DWS_SACRED_ICE_AGATHYS"
+
+    if hasStatus(objectGuid, want) then return end
+
+    local upgrading = enh and hasStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS")
+    if not upgrading and hasAnyIceAgathys(objectGuid) then return end
+    if not upgrading and pollCounter < (agathysCdUntil[key] or 0) then return end
+
+    if upgrading or (enh and hasAnyIceAgathys(objectGuid)) then
+        clearIceAgathys(objectGuid)
+    end
+
+    applyStatus(objectGuid, want, AGATHYS_DURATION)
     agathysCdUntil[key] = pollCounter + AGATHYS_CD_POLLS
-    markRefreshed(objectGuid, "DWS_SACRED_ICE_AGATHYS")
-    Ext.Utils.Print(MOD_TAG .. " ice agathys granted to " .. key)
+    Ext.Utils.Print(MOD_TAG .. " ice agathys granted -> " .. want .. " on " .. key)
 end
 
 local function noteUnmappedSurface(guid, surfaceName)
@@ -586,6 +742,10 @@ local function applySurfaceEffect(guid, sacred, isNew)
                 caster = zoneOwner[key] or guid,
             }
         end
+        refreshSacredTierEffect(guid, sacred, status)
+        if sacred == "DWS_SACRED_ICE" then
+            maybeGrantIceAgathys(guid)
+        end
         return
     end
 
@@ -599,6 +759,7 @@ local function applySurfaceEffect(guid, sacred, isNew)
 
     applyStatus(guid, status, SACRED_DURATION)
     markRefreshed(guid, status)
+    refreshSacredTierEffect(guid, sacred, status)
 
     if status == "DWS_CURSED_OIL_ENH" and not hasStatus(guid, "DWS_CLUMSY") then
         local caster = zoneOwner[guidKey(guid)] or guid
@@ -782,12 +943,13 @@ local function onTurnStarted(characterGuid)
     safe(function()
         local caster = zoneOwner[guidKey(characterGuid)] or characterGuid
         local level = Osi.GetLevel(caster) or 1
+        local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
+        local cursedAcidCfg = DamageFormuls["DWS_CURSED_ACID"]
         local dice = cfg.baseDice + math.floor(level / cfg.levelPerDie)
         local cursedAcidDice = cursedAcidCfg.baseDice + math.floor(level / cursedAcidCfg.levelPerDie)
 
         pollAndApplySurface(characterGuid)
         if hasStatus(characterGuid,"DWS_CURSED_ACID_ENH") then
-            local cursedAcidCfg = DamageFormuls["DWS_CURSED_ACID"]
             local amount = rollDice(cursedAcidDice,cursedAcidCfg.dieSides)
             Osi.ApplyDamage(characterGuid,amount,cursedAcidCfg.damageType,caster)
             Ext.Utils.Print(MOD_TAG .. " acid ENH tick " .. tostring(cursedAcidDice)
@@ -795,7 +957,6 @@ local function onTurnStarted(characterGuid)
         end
 
         if hasStatus(characterGuid,"DWS_CURSED_FIRE_ENH") then
-            local cfg = DamageFormuls["DWS_CURSED_FIRE_ENH"]
             local amount = rollDice(dice, cfg.dieSides)
             Osi.ApplyDamage(characterGuid, amount, cfg.damageType, caster)
             Ext.Utils.Print(MOD_TAG .. " fire ENH tick " .. tostring(dice) .. "d4 = " .. tostring(amount))
@@ -830,8 +991,14 @@ local function onTurnStarted(characterGuid)
             local boltDice = math.min(LightningCfg.maxDice, LightningCfg.baseDice + math.floor(level / LightningCfg.levelPerDie))
             local amount = rollDice(boltDice, LightningCfg.dieSides)
             Osi.ApplyDamage(characterGuid, amount, LightningCfg.damageType, caster)
+            
+            tryBattaryCharge(characterGuid, "Lightning", amount)
             Ext.Utils.Print(MOD_TAG .. " lightning ENH tick " .. tostring(boltDice)
                 .. "d4=" .. tostring(amount))
+        elseif hasStatus(characterGuid, "DWS_CURSED_LIGHTNING")
+            and hasStatus(characterGuid, "DWS_CURSED_BATTERY") then
+            
+            tryBattaryCharge(characterGuid, "Lightning", 1)
         end
 
     

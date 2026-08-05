@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v25]"
+local MOD_TAG = "[DWS v28]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -92,6 +92,10 @@ local CursedSurfaceConversions = {
 }
 
 local EnchantedConversions = {
+    ["DWS_SACRED_POISON"] = {
+        passive  = "DWS_ENH_SACRED_POISON",
+        enhanced = "DWS_SACRED_POISON_ENH",
+    },
     ["DWS_SACRED_FIRE"] = {
         passive  = "DWS_ENH_SACRED_FIRE",
         enhanced = "DWS_SACRED_FIRE_ENH",
@@ -193,6 +197,18 @@ local ManagedSacred = {
 -- Never auto-stripped; rely on their own duration.
 local PersistentSacred = {
     ["DWS_SACRED_POISON"]         = true,
+    ["DWS_SACRED_POISON_ENH"]     = true,
+    ["DWS_SACRED_POISON_VITAL"]   = true,
+    ["DWS_SACRED_POISON_STING_1"] = true,
+    ["DWS_SACRED_POISON_STING_2"] = true,
+    ["DWS_SACRED_POISON_STING_3"] = true,
+    ["DWS_SACRED_POISON_SURGE_1"] = true,
+    ["DWS_SACRED_POISON_SURGE_2"] = true,
+    ["DWS_SACRED_POISON_SURGE_3"] = true,
+    ["DWS_SACRED_POISON_GRACE_1"] = true,
+    ["DWS_SACRED_POISON_GRACE_2"] = true,
+    ["DWS_SACRED_POISON_GRACE_3"] = true,
+    ["DWS_SACRED_POISON_CRASH"]   = true,
     ["DWS_SACRED_LIGHTNING"]      = true,
     ["DWS_SACRED_ICE_AGATHYS"]    = true,
     ["DWS_SACRED_ICE_AGATHYS_1"]  = true,
@@ -251,7 +267,6 @@ local DamageFormuls = {
         levelPerDie = 4,
         maxDice = 3,
     },
-
 }
 
 local POISON_ENH_DEBUFFS = { "SLOW", "STINKING_CLOUD", "POISONED" }
@@ -282,6 +297,22 @@ local ICE_AGATHYS = {
     "DWS_SACRED_ICE_AGATHYS_2",
     "DWS_SACRED_ICE_AGATHYS_3",
     "DWS_SACRED_ICE_AGATHYS_4",
+}
+
+local POISON_STINGS = {
+    "DWS_SACRED_POISON_STING_1",
+    "DWS_SACRED_POISON_STING_2",
+    "DWS_SACRED_POISON_STING_3",
+}
+local POISON_SURGES = {
+    "DWS_SACRED_POISON_SURGE_1",
+    "DWS_SACRED_POISON_SURGE_2",
+    "DWS_SACRED_POISON_SURGE_3",
+}
+local POISON_GRACES = {
+    "DWS_SACRED_POISON_GRACE_1",
+    "DWS_SACRED_POISON_GRACE_2",
+    "DWS_SACRED_POISON_GRACE_3",
 }
 
 local ACID_STACK_STATUS = "DWS_CURSED_ACID_STACK"
@@ -340,6 +371,12 @@ local function inCombat(guid)
     local r
     pcall(function() r = Osi.IsInCombat(guid) end)
     return r == 1 or r == true
+end
+
+-- Turn-based exploration has no combat, but still has turns — don't use realtime poll heals there.
+local function inTurnBasedMode(guid)
+    local ent = Ext.Entity.Get(guid)
+    return ent ~= nil and ent.IsInTurnBasedMode ~= nil
 end
 
 local function safe(fn)
@@ -429,6 +466,19 @@ local function readStatusStacks(objectGuid, statusName)
     return 0
 end
 
+-- Layer statuses use FreezeDuration (turns). Always re-Apply to refresh lifetime;
+-- otherwise a one-shot duration=6 (seconds) expires while VITAL is still up.
+local function applyLayer(guid, list, want, durationTurns)
+    for _, name in ipairs(list) do
+        if name ~= want and hasStatus(guid, name) then
+            Osi.RemoveStatus(guid, name)
+        end
+    end
+    if want then
+        applyStatus(guid, want, durationTurns or 1)
+    end
+end
+
 local function clearMappedStatuses(objectGuid,statussesBystack)
     for _, statusName in pairs(statussesBystack) do
         if hasStatus(objectGuid, statusName) then
@@ -454,6 +504,29 @@ local function syncMappedStatuses(objectGuid,stackStatus,statussesBystack,effect
     end
 end
 
+local function syncSacredPoisonVital(guid)
+    local caster = zoneOwner[guidKey(guid)] or guid
+    local level = Osi.GetLevel(caster) or 1
+    local stacks = readStatusStacks(guid, "DWS_SACRED_POISON_VITAL")
+    local tier = math.min(3, math.max(1, math.ceil(level / 4)))
+
+    if stacks < 1 then
+        applyLayer(guid, POISON_STINGS, nil)
+        applyLayer(guid, POISON_SURGES, nil)
+        applyLayer(guid, POISON_GRACES, nil)
+        return
+    end
+
+    local dur = stacks
+    applyLayer(guid, POISON_STINGS, POISON_STINGS[tier], dur)
+    applyLayer(guid, POISON_SURGES, stacks >= 2 and POISON_SURGES[tier] or nil, dur)
+    applyLayer(guid, POISON_GRACES, stacks >= 3 and POISON_GRACES[tier] or nil, dur)
+    Ext.Utils.Print(MOD_TAG .. " poison vital sync stacks=" .. tostring(stacks)
+        .. " tier=" .. tostring(tier)
+        .. " sting=" .. tostring(POISON_STINGS[tier])
+        .. " on " .. guidKey(guid))
+end
+
 local function verifyStatsLoaded()
     if not Ext or not Ext.Stats or not Ext.Stats.Get then
         Ext.Utils.Print(MOD_TAG .. " cannot verify stats (Ext.Stats unavailable)")
@@ -463,6 +536,9 @@ local function verifyStatsLoaded()
         HEAL_1D4, HEAL_2D4, "DWS_SACRED_FIRE",
         "DWS_SACRED_FIRE_CLOAK_1", "DWS_SACRED_FIRE_CLOAK_2", "DWS_SACRED_FIRE_CLOAK_3",
         "DWS_SACRED_LIGHTNING", "DWS_SACRED_OIL", "DWS_SACRED_ICE",
+        "DWS_SACRED_POISON_ENH", "DWS_SACRED_POISON_VITAL",
+        "DWS_SACRED_POISON_STING_1", "DWS_SACRED_POISON_SURGE_1",
+        "DWS_SACRED_POISON_GRACE_1", "DWS_SACRED_POISON_CRASH",
     }
     for _, name in ipairs(required) do
         local ok, stat = pcall(Ext.Stats.Get, name)
@@ -473,6 +549,10 @@ local function verifyStatsLoaded()
                 " !!! STATS MISSING: " .. name ..
                 " -- .pak has OLD/NO stats. Re-publish + check Public/Stats in pak.")
         end
+    end
+    local okSting, sting = pcall(Ext.Stats.Get, "DWS_SACRED_POISON_STING_2")
+    if okSting and sting and sting.Boosts then
+        Ext.Utils.Print(MOD_TAG .. " STING_2 Boosts=" .. tostring(sting.Boosts))
     end
 end
 
@@ -536,6 +616,16 @@ local function tryHeal(guid, kind, healStatus)
     return ok
 end
 
+local function getTemporaryHp(guid)
+    local ent = Ext.Entity.Get(guid)
+    if not ent or not ent.Health then return 0 end
+    return ent.Health.TemporaryHp or 0
+end
+
+local function hasTemporaryHp(guid)
+    return getTemporaryHp(guid) > 0
+end
+
 local function stripShockStatuses(objectGuid)
     for _, s in ipairs(SHOCK_STATUS_NAMES) do
         if hasStatus(objectGuid, s) then Osi.RemoveStatus(objectGuid, s) end
@@ -582,17 +672,32 @@ local function applyElectrifiedLightning(objectGuid, isNew)
     end
 end
 
-local function startOrRefreshPoison(objectGuid)
+local function startOrRefreshPoison(objectGuid, isNew)
     local key = guidKey(objectGuid)
     Osi.RemoveStatus(objectGuid, "POISONED")
-    applyStatus(objectGuid, "DWS_SACRED_POISON", PERSIST_DURATION)
-    markRefreshed(objectGuid, "DWS_SACRED_POISON")
+    local status = previousEnchanced(objectGuid, "DWS_SACRED_POISON")
 
-    if poisonHeal[key] == nil then
+    applyStatus(objectGuid, status, PERSIST_DURATION)
+    markRefreshed(objectGuid, status)
+
+    -- Only start a regen cycle on first step onto the surface. While standing,
+    -- finishing the cycle must NOT instantly restart (poll was re-arming it).
+    if isNew and poisonHeal[key] == nil then
         poisonHeal[key] = { guid = objectGuid, turnsLeft = POISON_TURNS, pollAccum = 0 }
         tryHeal(objectGuid, "poison", HEAL_2D4)        -- instant tick on step (turn 1)
         poisonHeal[key].turnsLeft = POISON_TURNS - 1
         Ext.Utils.Print(MOD_TAG .. " poison regen (" .. POISON_TURNS .. " turns) on " .. key)
+    end
+
+    -- Safety net if STING expired before FreezeDuration fix / was stripped.
+    if status == "DWS_SACRED_POISON_ENH" and hasStatus(objectGuid, "DWS_SACRED_POISON_VITAL") then
+        local hasSting = false
+        for _, n in ipairs(POISON_STINGS) do
+            if hasStatus(objectGuid, n) then hasSting = true; break end
+        end
+        if not hasSting then
+            syncSacredPoisonVital(objectGuid)
+        end
     end
 end
 
@@ -689,22 +794,35 @@ local function clearIceAgathys(guid)
     clearTierStatuses(guid, ICE_AGATHYS)
 end
 
-local function maybeGrantIceAgathys(objectGuid)
+local function clearAgathysIfNoTempHp(guid)
+    if getTemporaryHp(guid) > 0 then return end
+    if not hasAnyIceAgathys(guid) then return end
+    clearIceAgathys(guid)
+    Ext.Utils.Print(MOD_TAG .. " ice agathys stripped (tempHP=0) on " .. guidKey(guid))
+end
+
+local function maybeGrantIceAgathys(objectGuid, enhOverride)
     local key = guidKey(objectGuid)
-    local enh = hasStatus(objectGuid, "DWS_SACRED_ICE_ENH")
+    local enh = enhOverride
+    if enh == nil then
+        enh = hasStatus(objectGuid, "DWS_SACRED_ICE_ENH")
+    end
     local want = enh
         and sacredIceAgathysForLevel(Osi.GetLevel(zoneOwner[key] or objectGuid) or 1)
         or "DWS_SACRED_ICE_AGATHYS"
 
     if hasStatus(objectGuid, want) then return end
 
-    local upgrading = enh and hasStatus(objectGuid, "DWS_SACRED_ICE_AGATHYS")
+    local upgrading = enh and hasAnyIceAgathys(objectGuid)
+        and not hasStatus(objectGuid, want)
     if not upgrading and hasAnyIceAgathys(objectGuid) then return end
     if not upgrading and pollCounter < (agathysCdUntil[key] or 0) then return end
 
-    if upgrading or (enh and hasAnyIceAgathys(objectGuid)) then
+    if upgrading then
         clearIceAgathys(objectGuid)
     end
+
+
 
     applyStatus(objectGuid, want, AGATHYS_DURATION)
     agathysCdUntil[key] = pollCounter + AGATHYS_CD_POLLS
@@ -724,7 +842,7 @@ local function applySurfaceEffect(guid, sacred, isNew)
     local status = previousEnchanced(guid, sacred)
     
     if sacred == "DWS_SACRED_POISON" then
-        startOrRefreshPoison(guid)
+        startOrRefreshPoison(guid, isNew)
         return
     end
 
@@ -744,7 +862,7 @@ local function applySurfaceEffect(guid, sacred, isNew)
         end
         refreshSacredTierEffect(guid, sacred, status)
         if sacred == "DWS_SACRED_ICE" then
-            maybeGrantIceAgathys(guid)
+            maybeGrantIceAgathys(guid, status == "DWS_SACRED_ICE_ENH")
         end
         return
     end
@@ -773,7 +891,7 @@ local function applySurfaceEffect(guid, sacred, isNew)
     if sacred == "DWS_SACRED_FIRE" then
         if isNew then tryHeal(guid, "fire", HEAL_1D4) end
     elseif sacred == "DWS_SACRED_ICE" then
-        maybeGrantIceAgathys(guid)
+        maybeGrantIceAgathys(guid, status == "DWS_SACRED_ICE_ENH")
     end
 end
 
@@ -818,6 +936,9 @@ local function oocHeals(guid)
         tryHeal(guid, "water", HEAL_2D4)
     end
 
+    -- In turn-based (even outside combat) poison ticks on TurnStarted only.
+    if inTurnBasedMode(guid) then return end
+
     local info = poisonHeal[key]
     if info and info.turnsLeft > 0 then
         info.pollAccum = (info.pollAccum or 0) + 1
@@ -856,6 +977,13 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
         poisonOwner[key] = zoneOwner[key] or poisonOwner[key] or causeGuid
         safe(function()
             syncMappedStatuses(objectGuid,"DWS_CURSED_POISON_STACK_ENH",POISON_ENH_BY_STACK,6,"poison ENH")
+        end)
+        return
+    end
+
+    if statusName == "DWS_SACRED_POISON_VITAL" then
+        safe(function()
+            syncSacredPoisonVital(objectGuid)
         end)
         return
     end
@@ -916,6 +1044,16 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
         return
     end
 
+    if statusName == "DWS_SACRED_POISON_VITAL" then 
+        safe(function()
+            clearMappedStatuses(objectGuid, POISON_STINGS)
+            clearMappedStatuses(objectGuid, POISON_SURGES)
+            clearMappedStatuses(objectGuid, POISON_GRACES)
+            applyStatus(objectGuid, "DWS_SACRED_POISON_CRASH", 1)
+        end)
+        return
+    end
+
     if statusName ~= SACRED_MARK and statusName ~= CURSED_MARK then return end
 
     local key = guidKey(objectGuid)
@@ -938,6 +1076,13 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
 end
 
 local function onTurnStarted(characterGuid)
+    -- VITAL layers must refresh even after leaving the zone mark.
+    if hasStatus(characterGuid, "DWS_SACRED_POISON_VITAL") then
+        safe(function()
+            syncSacredPoisonVital(characterGuid)
+        end)
+    end
+
     if not hasAnyZoneMark( characterGuid) then return end
 
     safe(function()
@@ -1020,6 +1165,8 @@ end
 
 local function onAttackedBy(defender, attackerOwner, attacker, damageType, damageAmount, _damageCause, storyActionID)
     if type(damageAmount) == "number" and damageAmount <= 0 then return end
+
+    clearAgathysIfNoTempHp(defender)
 
     tryBattaryCharge(defender, damageType, damageAmount)
 

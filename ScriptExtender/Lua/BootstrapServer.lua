@@ -1,11 +1,13 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v28]"
+local MOD_TAG = "[DWS v46]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
 local HEAL_1D4    = "DWS_SACRED_HEAL_1D4"
 local HEAL_2D4    = "DWS_SACRED_HEAL_2D4"
+local HEAL_2D6    = "DWS_SACRED_HEAL_2D6"
+local HEAL_2D8    = "DWS_SACRED_HEAL_2D8"
 local AURA_CURSED = "DWS_CURSED_GROUND_ZONE_AURA"
 local AURA_SACRED = "DWS_SACRED_GROUND_ZONE_AURA"
 
@@ -92,6 +94,10 @@ local CursedSurfaceConversions = {
 }
 
 local EnchantedConversions = {
+    ["DWS_SACRED_ACID"] = {
+        passive  = "DWS_ENH_SACRED_ACID",
+        enhanced = "DWS_SACRED_ACID_ENH",  
+    },
     ["DWS_SACRED_POISON"] = {
         passive  = "DWS_ENH_SACRED_POISON",
         enhanced = "DWS_SACRED_POISON_ENH",
@@ -107,6 +113,10 @@ local EnchantedConversions = {
     ["DWS_SACRED_ICE"] = {
         passive  = "DWS_ENH_SACRED_ICE",
         enhanced = "DWS_SACRED_ICE_ENH",
+    },
+    ["DWS_SACRED_CLEANSE_WATHER"] = {
+        passive  = "DWS_ENH_SACRED_WATER",
+        enhanced = "DWS_SACRED_WATER_ENH",
     },
     ["DWS_CURSED_FIRE"] = {
         passive  = "DWS_ENH_CURSED_FIRE", 
@@ -192,6 +202,13 @@ local ManagedSacred = {
     "DWS_CURSED_BLOOD_ENH",
     "DWS_CURSED_WATER_ENH",
     "DWS_CURSED_LIGHTNING_ENH",
+    "DWS_SACRED_ACID_ENH",
+    "DWS_SACRED_ACID_ENH_1",
+    "DWS_SACRED_ACID_ENH_2",
+    "DWS_SACRED_ACID_ENH_3",
+    "DWS_SACRED_WATER_ENH_1",
+    "DWS_SACRED_WATER_ENH_2",
+    "DWS_SACRED_WATER_ENH_3",
 }
 
 -- Never auto-stripped; rely on their own duration.
@@ -315,6 +332,46 @@ local POISON_GRACES = {
     "DWS_SACRED_POISON_GRACE_3",
 }
 
+local ACID_ENHS = {
+    "DWS_SACRED_ACID_ENH_1",
+    "DWS_SACRED_ACID_ENH_2",
+    "DWS_SACRED_ACID_ENH_3",
+}
+
+local WATER_SACRED_BASE = "DWS_SACRED_CLEANSE_WATHER"
+local WATER_ENH_PASSIVE = "DWS_ENH_SACRED_WATER"
+local WATER_ENHS = {
+    "DWS_SACRED_WATER_ENH_1",
+    "DWS_SACRED_WATER_ENH_2",
+    "DWS_SACRED_WATER_ENH_3",
+}
+local WATER_CLEANSE_SAVE_DC = 13
+local WATER_RINSE_OK   = "DWS_SACRED_WATER_RINSE_OK"
+local WATER_RINSE_FAIL = "DWS_SACRED_WATER_RINSE_FAIL"
+local SACRED_WATER_BUFF_DURATION = 12   -- ~2 turns; refreshed while on tile
+
+local WATER_CLEANSE_TIER1 = {
+    "BLINDED", "FRIGHTENED", "SLOWED", "SILENCED", "MUTE", "RESTRAINED", "ENWEBBED", "ENTANGLED", "ENSNARED",
+}
+local WATER_CLEANSE_TIER2 = {
+    "BURNING", "POISONED", "BLEEDING", "ACID", "FROSTBITTEN", "MAG_FROST",
+}
+local WATER_CLEANSE_TIER3 = {
+    "BANE", "HEX", "HAG_RIDDEN", "REELING", "DAZED", "RADIATING_ORB",
+}
+local SACRED_ACID_CORRODE_LEGACY = "DWS_SACRED_ACID_CORRODE"
+local SACRED_ACID_WARD_LEGACY = "DWS_SACRED_ACID_WARD"
+local SACRED_ACID_CORRODE_TIERS = {
+    "DWS_SACRED_ACID_CORRODE_1", "DWS_SACRED_ACID_CORRODE_2", "DWS_SACRED_ACID_CORRODE_3",
+    "DWS_SACRED_ACID_CORRODE_4", "DWS_SACRED_ACID_CORRODE_5", "DWS_SACRED_ACID_CORRODE_6",
+}
+local SACRED_ACID_WARD_TIERS = {
+    "DWS_SACRED_ACID_WARD_1", "DWS_SACRED_ACID_WARD_2", "DWS_SACRED_ACID_WARD_3",
+    "DWS_SACRED_ACID_WARD_4", "DWS_SACRED_ACID_WARD_5", "DWS_SACRED_ACID_WARD_6",
+}
+local SACRED_ACID_CORRODE_CAP = 6
+local SACRED_ACID_WARD_CAP = 6
+
 local ACID_STACK_STATUS = "DWS_CURSED_ACID_STACK"
 local ACID_ONHIT_COOLDOWN_MS = 600
 local acidHitBusy = {}       -- swingKey / echoKey -> locked
@@ -335,6 +392,14 @@ local cursedBloodMarked     = {}   -- guidKey -> true, while standing in the cur
 local zoneOwner             = {}   -- victimKey -> casterGuid
 local auraCaster            = {}   -- summonKey -> playerGuid
 local poisonOwner           = {}   -- victimKey -> casterGuid
+local acidStealLastSwing    = {}   -- swingKey -> storyActionID (one steal proc per action)
+local sacredAcidCorrodeStacks = {} -- defenderKey -> stack count (1..6)
+local sacredAcidWardStacks    = {} -- attackerKey -> stack count
+local sacredAcidTierBusy    = false -- suppress StatusRemoved while swapping tiers
+local waterCleansePending   = {}   -- key -> true: failed end-turn rinse save, remove 1 at next turn start
+local waterBuffStatMissing  = {}   -- statusName -> true if Ext.Stats says stat absent (.pak)
+local waterOocTurnPolls     = {}   -- key -> poll count toward virtual turn (realtime, no TurnEnded)
+local tryHeal               -- forward declaration; defined after applyStatus / hpInfo
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
 
@@ -354,7 +419,254 @@ local function hasPassive(guid,passiveName)
     return r == 1 or r == true
 end
 
-local function previousEnchanced(guid,baseStatus)
+local function sacredAcidEnhForLevel(level)
+    local tier = math.min(3, math.max(1, math.ceil((level or 1) / 4)))
+    return ACID_ENHS[tier]
+end
+
+local function hasSacredAcidEnh(guid)
+    for _, name in ipairs(ACID_ENHS) do
+        if hasStatus(guid, name) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Steal works while standing on acid ENH, or anywhere in the zone if acid enhancement is unlocked.
+local function hasSacredAcidStealPrivilege(aGuid)
+    if hasSacredAcidEnh(aGuid) then return true end
+    if not hasStatus(aGuid, SACRED_MARK) then return false end
+    local caster = zoneOwner[guidKey(aGuid)] or aGuid
+    local entry = EnchantedConversions["DWS_SACRED_ACID"]
+    return entry ~= nil and hasPassive(caster, entry.passive)
+end
+
+-- Must be before isStandingOnSacredWater (Lua locals are not visible above their definition).
+local function isElectrifiedSurface(surfaceName)
+    if not surfaceName then return false end
+    return tostring(surfaceName):find("Electrified", 1, true) ~= nil
+end
+
+local function currentSacredOf(guid)
+    local surfaceName = Osi.GetSurfaceGroundAt(guid)
+    if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
+        return nil
+    end
+    if isElectrifiedSurface(surfaceName) then return "DWS_SACRED_LIGHTNING" end
+    return SurfaceGroundConversions[tostring(surfaceName)]
+end
+
+local function sacredWaterEnhForLevel(level)
+    local tier = math.min(3, math.max(1, math.ceil((level or 1) / 4)))
+    return WATER_ENHS[tier]
+end
+
+local function hasSacredWaterBuff(guid)
+    if hasStatus(guid, WATER_SACRED_BASE) then return true end
+    for _, name in ipairs(WATER_ENHS) do
+        if hasStatus(guid, name) then return true end
+    end
+    return false
+end
+
+local function wasOnSacredWaterThisTurn(guid)
+    local r = refreshedThisTurn[guidKey(guid)]
+    if not r then return false end
+    if r[WATER_SACRED_BASE] then return true end
+    for _, name in ipairs(WATER_ENHS) do
+        if r[name] then return true end
+    end
+    return false
+end
+
+local function isInSacredWaterZone(guid)
+    if not hasStatus(guid, SACRED_MARK) then return false end
+    if currentSacredOf(guid) == WATER_SACRED_BASE then return true end
+    return wasOnSacredWaterThisTurn(guid)
+end
+
+-- Legacy name: effects use zone tile + sacred mark (buff may lag one frame or fail UI).
+local function isStandingOnSacredWater(guid)
+    return isInSacredWaterZone(guid)
+end
+
+local function sacredWaterCleanseLayerCount(casterLevel, hasWaterEnh)
+    if not hasWaterEnh then return 1 end
+    local lvl = casterLevel or 1
+    if lvl >= 9 then return 3 end
+    if lvl >= 6 then return 2 end
+    return 1
+end
+
+local function sacredWaterCleanseLists(layerCount)
+    local out = {}
+    if layerCount >= 3 then out[#out + 1] = WATER_CLEANSE_TIER1 end
+    if layerCount >= 2 then out[#out + 1] = WATER_CLEANSE_TIER2 end
+    out[#out + 1] = WATER_CLEANSE_TIER3
+    return out
+end
+
+local function removeOneWaterCleanse(guid, layerCount)
+    for _, list in ipairs(sacredWaterCleanseLists(layerCount)) do
+        for _, statusName in ipairs(list) do
+            if hasStatus(guid, statusName) then
+                Osi.RemoveStatus(guid, statusName)
+                return statusName
+            end
+        end
+    end
+    return nil
+end
+
+local function removeAllWaterCleanseInPool(guid, layerCount)
+    local n = 0
+    for _, list in ipairs(sacredWaterCleanseLists(layerCount)) do
+        for _, statusName in ipairs(list) do
+            if hasStatus(guid, statusName) then
+                Osi.RemoveStatus(guid, statusName)
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+local function constitutionModifier(guid)
+    local score = Osi.GetAbility(guid, "Constitution")
+    if type(score) ~= "number" then return 0 end
+    return math.floor((score - 10) / 2)
+end
+
+local function constitutionSaveProficiency(guid)
+    local level = Osi.GetLevel(guid) or 1
+    local pb = 2 + math.floor((level - 1) / 4)
+    local prof = 0
+    pcall(function()
+        local ent = Ext.Entity.Get(guid)
+        local stats = ent and ent.Stats
+        if not stats then return end
+        if stats.SavingThrows and stats.SavingThrows.Constitution then
+            prof = pb
+            return
+        end
+        if stats.SavingThrowProficiency and stats.SavingThrowProficiency.Constitution then
+            prof = pb
+        end
+    end)
+    return prof
+end
+
+-- BG3 Osiris has no RollSavingThrow; use d20 + CON (Entity prof when available).
+local function rollWaterCleanseSave(guid)
+    local mod = constitutionModifier(guid)
+    local prof = constitutionSaveProficiency(guid)
+    local d20 = Ext.Utils.Random(1, 20)
+    local total = d20 + mod + prof
+    local success = total >= WATER_CLEANSE_SAVE_DC
+    Ext.Utils.Print(MOD_TAG .. " water CON save roll d20=" .. tostring(d20)
+        .. " mod=" .. tostring(mod) .. " prof=" .. tostring(prof)
+        .. " total=" .. tostring(total) .. " vs DC" .. tostring(WATER_CLEANSE_SAVE_DC)
+        .. " => " .. (success and "SUCCESS" or "FAIL") .. " on " .. guidKey(guid))
+    return success
+end
+
+local function sacredWaterHealStatus(casterLevel, hasWaterEnh)
+    if not hasWaterEnh then return HEAL_2D4 end
+    local tier = math.min(3, math.max(1, math.ceil((casterLevel or 1) / 4)))
+    if tier == 1 then return HEAL_2D4 end
+    if tier == 2 then return HEAL_2D6 end
+    return HEAL_2D8
+end
+
+local function sacredWaterCleanseContext(guid)
+    local caster = zoneOwner[guidKey(guid)] or guid
+    local level = Osi.GetLevel(caster) or 1
+    local hasEnh = hasPassive(caster, WATER_ENH_PASSIVE)
+    local layers = sacredWaterCleanseLayerCount(level, hasEnh)
+    return level, hasEnh, layers
+end
+
+local function applySacredWaterRinseFromStat(guid, success)
+    if not isInSacredWaterZone(guid) and not wasOnSacredWaterThisTurn(guid) then return end
+    local _, _, layers = sacredWaterCleanseContext(guid)
+    local key = guidKey(guid)
+    if success then
+        local n = removeAllWaterCleanseInPool(guid, layers)
+        waterCleansePending[key] = nil
+        Ext.Utils.Print(MOD_TAG .. " water buff rinse OK cleared=" .. tostring(n) .. " on " .. key)
+    else
+        waterCleansePending[key] = true
+        Ext.Utils.Print(MOD_TAG .. " water buff rinse fail -> pending on " .. key)
+    end
+end
+
+local function sacredWaterOnEnterCleanse(guid)
+    if not isInSacredWaterZone(guid) then return end
+    local _, _, layers = sacredWaterCleanseContext(guid)
+    local removed = removeOneWaterCleanse(guid, layers)
+    if removed then
+        Ext.Utils.Print(MOD_TAG .. " water enter cleanse -1 " .. removed .. " on " .. guidKey(guid))
+    else
+        Ext.Utils.Print(MOD_TAG .. " water enter cleanse (no debuff in pool) layers="
+            .. tostring(layers) .. " on " .. guidKey(guid))
+    end
+end
+
+local function sacredWaterRinseCon(guid, contextLabel)
+    local key = guidKey(guid)
+    if not isStandingOnSacredWater(guid) then
+        waterCleansePending[key] = nil
+        if hasStatus(guid, SACRED_MARK) or markedCharacters[key] then
+            Ext.Utils.Print(MOD_TAG .. " water " .. contextLabel .. " skip (not on water) tile="
+                .. tostring(currentSacredOf(guid))
+                .. " refreshedWater=" .. tostring(wasOnSacredWaterThisTurn(guid))
+                .. " on " .. key)
+        end
+        return false
+    end
+    if hasSacredWaterBuff(guid) then
+        Ext.Utils.Print(MOD_TAG .. " water " .. contextLabel
+            .. " CON on buff EndTurn tick (TooltipSave); Lua roll skipped on " .. key)
+        return true
+    end
+    Ext.Utils.Print(MOD_TAG .. " water " .. contextLabel .. " rinse (CON DC "
+        .. tostring(WATER_CLEANSE_SAVE_DC) .. " Lua fallback) on " .. key)
+    local _, _, layers = sacredWaterCleanseContext(guid)
+    if rollWaterCleanseSave(guid) then
+        local n = removeAllWaterCleanseInPool(guid, layers)
+        waterCleansePending[key] = nil
+        Ext.Utils.Print(MOD_TAG .. " water rinse save OK cleared=" .. tostring(n) .. " on " .. key)
+    else
+        waterCleansePending[key] = true
+        Ext.Utils.Print(MOD_TAG .. " water rinse save fail pending " .. key)
+    end
+    return true
+end
+
+local function trySacredWaterTurnEnd(guid)
+    local level, hasEnh, _ = sacredWaterCleanseContext(guid)
+    if sacredWaterRinseCon(guid, "turn-end") then
+        tryHeal(guid, "water", sacredWaterHealStatus(level, hasEnh))
+    end
+end
+
+local function trySacredWaterTurnStartPending(guid)
+    local key = guidKey(guid)
+    if not waterCleansePending[key] then return end
+    if not isStandingOnSacredWater(guid) then
+        waterCleansePending[key] = nil
+        return
+    end
+    local _, _, layers = sacredWaterCleanseContext(guid)
+    local removed = removeOneWaterCleanse(guid, layers)
+    waterCleansePending[key] = nil
+    if removed then
+        Ext.Utils.Print(MOD_TAG .. " water pending cleanse -1 " .. removed .. " on " .. key)
+    end
+end
+
+local function previousEnchanced(guid,baseStatus) 
     local entry = EnchantedConversions[baseStatus]
     if entry == nil then
         return baseStatus
@@ -362,6 +674,12 @@ local function previousEnchanced(guid,baseStatus)
 
     local caster = zoneOwner[guidKey(guid)] or guid
     if hasPassive(caster, entry.passive) then
+        if baseStatus == "DWS_SACRED_ACID" then
+            return sacredAcidEnhForLevel(Osi.GetLevel(caster) or 1)
+        end
+        if baseStatus == WATER_SACRED_BASE then
+            return sacredWaterEnhForLevel(Osi.GetLevel(caster) or 1)
+        end
         return entry.enhanced
     end
     return baseStatus
@@ -375,8 +693,9 @@ end
 
 -- Turn-based exploration has no combat, but still has turns — don't use realtime poll heals there.
 local function inTurnBasedMode(guid)
-    local ent = Ext.Entity.Get(guid)
-    return ent ~= nil and ent.IsInTurnBasedMode ~= nil
+    local r
+    pcall(function() r = Osi.IsInForceTurnBasedMode(guid) end)
+    return r == 1 or r == true
 end
 
 local function safe(fn)
@@ -405,6 +724,11 @@ local function markRefreshed(guid, sacred)
     local key = guidKey(guid)
     refreshedThisTurn[key] = refreshedThisTurn[key] or {}
     refreshedThisTurn[key][sacred] = true
+end
+
+local function markSacredWaterPollRefresh(guid, statusName)
+    markRefreshed(guid, statusName)
+    markRefreshed(guid, WATER_SACRED_BASE)
 end
 
 local function logIfChanged(guid, sacred)
@@ -436,20 +760,6 @@ local function wasRefreshed(guid, sacred)
     return refreshedThisTurn[key] and refreshedThisTurn[key][sacred]
 end
 
-local function isElectrifiedSurface(surfaceName)
-    if not surfaceName then return false end
-    return tostring(surfaceName):find("Electrified", 1, true) ~= nil
-end
-
-local function currentSacredOf(guid)
-    local surfaceName = Osi.GetSurfaceGroundAt(guid)
-    if not surfaceName or surfaceName == "" or tostring(surfaceName) == "SurfaceNone" then
-        return nil
-    end
-    if isElectrifiedSurface(surfaceName) then return "DWS_SACRED_LIGHTNING" end
-    return SurfaceGroundConversions[tostring(surfaceName)]
-end
-
 local function applyStatus(objectGuid, statusName, duration)
     Osi.ApplyStatus(objectGuid, statusName, duration, 1, objectGuid)
 end
@@ -466,8 +776,6 @@ local function readStatusStacks(objectGuid, statusName)
     return 0
 end
 
--- Layer statuses use FreezeDuration (turns). Always re-Apply to refresh lifetime;
--- otherwise a one-shot duration=6 (seconds) expires while VITAL is still up.
 local function applyLayer(guid, list, want, durationTurns)
     for _, name in ipairs(list) do
         if name ~= want and hasStatus(guid, name) then
@@ -548,6 +856,34 @@ local function verifyStatsLoaded()
             Ext.Utils.Print(MOD_TAG ..
                 " !!! STATS MISSING: " .. name ..
                 " -- .pak has OLD/NO stats. Re-publish + check Public/Stats in pak.")
+            if name == WATER_SACRED_BASE
+                or name == "DWS_SACRED_WATER_ENH_1"
+                or name == "DWS_SACRED_WATER_ENH_2"
+                or name == "DWS_SACRED_WATER_ENH_3" then
+                waterBuffStatMissing[name] = true
+            end
+        end
+    end
+    for _, name in ipairs({
+        WATER_SACRED_BASE,
+        "DWS_SACRED_WATER_ENH_1",
+        "DWS_SACRED_WATER_ENH_2",
+        "DWS_SACRED_WATER_ENH_3",
+        HEAL_2D6,
+        HEAL_2D8,
+        WATER_RINSE_OK,
+        WATER_RINSE_FAIL,
+    }) do
+        if not waterBuffStatMissing[name] then
+            local ok, stat = pcall(Ext.Stats.Get, name)
+            if ok and stat then
+                Ext.Utils.Print(MOD_TAG .. " stats OK: " .. name)
+            else
+                waterBuffStatMissing[name] = true
+                Ext.Utils.Print(MOD_TAG ..
+                    " !!! STATS MISSING: " .. name ..
+                    " -- water buff/heal tier may not ApplyStatus. Re-publish mod.")
+            end
         end
     end
     local okSting, sting = pcall(Ext.Stats.Get, "DWS_SACRED_POISON_STING_2")
@@ -596,7 +932,7 @@ local function diceCount(level,cfg)
     return cfg.baseDice + math.floor(level / cfg.levelPerDie)
 end
 
-local function tryHeal(guid, kind, healStatus)
+tryHeal = function(guid, kind, healStatus)
     if not isCharacter(guid) then return false end
     local key = guidKey(guid)
     lastHealMs[key] = lastHealMs[key] or {}
@@ -680,8 +1016,6 @@ local function startOrRefreshPoison(objectGuid, isNew)
     applyStatus(objectGuid, status, PERSIST_DURATION)
     markRefreshed(objectGuid, status)
 
-    -- Only start a regen cycle on first step onto the surface. While standing,
-    -- finishing the cycle must NOT instantly restart (poll was re-arming it).
     if isNew and poisonHeal[key] == nil then
         poisonHeal[key] = { guid = objectGuid, turnsLeft = POISON_TURNS, pollAccum = 0 }
         tryHeal(objectGuid, "poison", HEAL_2D4)        -- instant tick on step (turn 1)
@@ -851,8 +1185,38 @@ local function applySurfaceEffect(guid, sacred, isNew)
         return
     end
 
+    if sacred == "DWS_SACRED_ACID" then
+        if status ~= "DWS_SACRED_ACID" and hasStatus(guid, "DWS_SACRED_ACID") then
+            Osi.RemoveStatus(guid, "DWS_SACRED_ACID")
+        end
+        for _, name in ipairs(ACID_ENHS) do
+            if name ~= status and hasStatus(guid, name) then
+                Osi.RemoveStatus(guid, name)
+            end
+        end
+    end
+
+    if sacred == WATER_SACRED_BASE then
+        if status ~= WATER_SACRED_BASE and hasStatus(guid, WATER_SACRED_BASE) then
+            Osi.RemoveStatus(guid, WATER_SACRED_BASE)
+        end
+        for _, name in ipairs(WATER_ENHS) do
+            if name ~= status and hasStatus(guid, name) then
+                Osi.RemoveStatus(guid, name)
+            end
+        end
+    end
+
+    if waterBuffStatMissing[status] then
+        Ext.Utils.Print(MOD_TAG .. " water stat was missing at boot; still trying ApplyStatus " .. status)
+    end
+
     if hasStatus(guid, status) then
-        markRefreshed(guid, status)
+        if sacred == WATER_SACRED_BASE then
+            markSacredWaterPollRefresh(guid, status)
+        else
+            markRefreshed(guid, status)
+        end
         if sacred == "DWS_CURSED_BLOOD" then
             local key = guidKey(guid)
             cursedBloodMarked[key] = {
@@ -863,6 +1227,9 @@ local function applySurfaceEffect(guid, sacred, isNew)
         refreshSacredTierEffect(guid, sacred, status)
         if sacred == "DWS_SACRED_ICE" then
             maybeGrantIceAgathys(guid, status == "DWS_SACRED_ICE_ENH")
+        end
+        if sacred == WATER_SACRED_BASE and isNew then
+            sacredWaterOnEnterCleanse(guid)
         end
         return
     end
@@ -875,9 +1242,24 @@ local function applySurfaceEffect(guid, sacred, isNew)
         }
     end
 
-    applyStatus(guid, status, SACRED_DURATION)
-    markRefreshed(guid, status)
+    local buffDuration = (sacred == WATER_SACRED_BASE) and SACRED_WATER_BUFF_DURATION or SACRED_DURATION
+    applyStatus(guid, status, buffDuration)
+    if sacred == WATER_SACRED_BASE then
+        markSacredWaterPollRefresh(guid, status)
+    else
+        markRefreshed(guid, status)
+    end
     refreshSacredTierEffect(guid, sacred, status)
+    if sacred == WATER_SACRED_BASE then
+        local statLoaded = false
+        pcall(function()
+            if Ext.Stats.Get(status) then statLoaded = true end
+        end)
+        Ext.Utils.Print(MOD_TAG .. " water buff apply " .. status
+            .. " active=" .. tostring(hasStatus(guid, status))
+            .. " statLoaded=" .. tostring(statLoaded)
+            .. " on " .. guidKey(guid))
+    end
 
     if status == "DWS_CURSED_OIL_ENH" and not hasStatus(guid, "DWS_CLUMSY") then
         local caster = zoneOwner[guidKey(guid)] or guid
@@ -890,6 +1272,8 @@ local function applySurfaceEffect(guid, sacred, isNew)
 
     if sacred == "DWS_SACRED_FIRE" then
         if isNew then tryHeal(guid, "fire", HEAL_1D4) end
+    elseif sacred == WATER_SACRED_BASE then
+        if isNew then sacredWaterOnEnterCleanse(guid) end
     elseif sacred == "DWS_SACRED_ICE" then
         maybeGrantIceAgathys(guid, status == "DWS_SACRED_ICE_ENH")
     end
@@ -928,16 +1312,15 @@ local function pollAndApplySurface(characterGuid)
 end
 
 local function oocHeals(guid)
+    -- Combat / force turn-based: heals only on TurnEnded / TurnStarted hooks.
+    if inTurnBasedMode(guid) then return end
+
     local key = guidKey(guid)
     local sacred = currentSacredOf(guid)
     if sacred == "DWS_SACRED_FIRE" then
         tryHeal(guid, "fire", HEAL_1D4)
-    elseif sacred == "DWS_SACRED_CLEANSE_WATHER" then
-        tryHeal(guid, "water", HEAL_2D4)
     end
-
-    -- In turn-based (even outside combat) poison ticks on TurnStarted only.
-    if inTurnBasedMode(guid) then return end
+    -- Sacred water: trySacredWaterTurnEnd on TurnEnded, TB TurnStarted, or OOC virtual turn poll.
 
     local info = poisonHeal[key]
     if info and info.turnsLeft > 0 then
@@ -955,6 +1338,14 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
     if statusName == AURA_CURSED or statusName == AURA_SACRED then
         auraCaster[guidKey(objectGuid)] = causeGuid
         Ext.Utils.Print(MOD_TAG .. " aura on " .. guidKey(objectGuid) .. " caster=" .. tostring(causeGuid))
+        return
+    end
+
+    if statusName == WATER_RINSE_OK or statusName == WATER_RINSE_FAIL then
+        safe(function()
+            Osi.RemoveStatus(objectGuid, statusName)
+            applySacredWaterRinseFromStat(objectGuid, statusName == WATER_RINSE_OK)
+        end)
         return
     end
     
@@ -1035,6 +1426,147 @@ local function onStatusApplied(objectGuid, statusName, causeGuid, _)
     end)
 end
 
+local function stripLegacySacredAcidStatus(guid)
+    if hasStatus(guid, SACRED_ACID_CORRODE_LEGACY) then
+        Osi.RemoveStatus(guid, SACRED_ACID_CORRODE_LEGACY)
+    end
+    if hasStatus(guid, SACRED_ACID_WARD_LEGACY) then
+        Osi.RemoveStatus(guid, SACRED_ACID_WARD_LEGACY)
+    end
+end
+
+local function inferSacredAcidStacksFromTiers(guid, tierList, legacyName)
+    for i = #tierList, 1, -1 do
+        if hasStatus(guid, tierList[i]) then
+            return i
+        end
+    end
+    if legacyName and hasStatus(guid, legacyName) then
+        return 1
+    end
+    return 0
+end
+
+local function currentSacredAcidStacks(guid, tierList, legacyName, trackTable)
+    local key = guidKey(guid)
+    local inferred = inferSacredAcidStacksFromTiers(guid, tierList, legacyName)
+    local tracked = trackTable[key]
+    local stacks = math.max(inferred, type(tracked) == "number" and tracked or 0)
+    if stacks >= 1 then
+        trackTable[key] = stacks
+    elseif trackTable[key] then
+        trackTable[key] = nil
+    end
+    return stacks
+end
+
+local function sacredAcidDurationTurns(stacks)
+    return math.max(1, stacks) * 6
+end
+
+local function applySacredAcidStackStatus(targetGuid, tierList, legacyName, stacks, sourceGuid, trackTable)
+    stacks = math.min(#tierList, math.max(1, stacks))
+    local want = tierList[stacks]
+    sacredAcidTierBusy = true
+    stripLegacySacredAcidStatus(targetGuid)
+    for _, name in ipairs(tierList) do
+        if name ~= want and hasStatus(targetGuid, name) then
+            Osi.RemoveStatus(targetGuid, name)
+        end
+    end
+    if hasStatus(targetGuid, want) then
+        Osi.RemoveStatus(targetGuid, want)
+    end
+    -- Osiris duration is seconds (6 = 1 turn). Stacks = turns remaining in UI; decay via Lua on TurnEnded.
+    Osi.ApplyStatus(targetGuid, want, sacredAcidDurationTurns(stacks), 1, sourceGuid)
+    trackTable[guidKey(targetGuid)] = stacks
+    sacredAcidTierBusy = false
+end
+
+local function clearSacredAcidTiers(guid, tierList, legacyName, trackTable)
+    sacredAcidTierBusy = true
+    stripLegacySacredAcidStatus(guid)
+    for _, name in ipairs(tierList) do
+        if hasStatus(guid, name) then
+            Osi.RemoveStatus(guid, name)
+        end
+    end
+    trackTable[guidKey(guid)] = nil
+    sacredAcidTierBusy = false
+end
+
+local function decaySacredAcidStacksOnTurnEnd(characterGuid)
+    local key = guidKey(characterGuid)
+
+    local c = sacredAcidCorrodeStacks[key]
+    if not c or c < 1 then
+        c = inferSacredAcidStacksFromTiers(characterGuid, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY)
+    end
+    if c >= 1 then
+        local nextC = c - 1
+        if nextC < 1 then
+            clearSacredAcidTiers(characterGuid, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY, sacredAcidCorrodeStacks)
+        else
+            applySacredAcidStackStatus(characterGuid, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY,
+                nextC, characterGuid, sacredAcidCorrodeStacks)
+        end
+    end
+
+    local w = sacredAcidWardStacks[key]
+    if not w or w < 1 then
+        w = inferSacredAcidStacksFromTiers(characterGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY)
+    end
+    if w >= 1 then
+        local nextW = w - 1
+        if nextW < 1 then
+            clearSacredAcidTiers(characterGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY, sacredAcidWardStacks)
+        else
+            applySacredAcidStackStatus(characterGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY,
+                nextW, characterGuid, sacredAcidWardStacks)
+        end
+    end
+end
+
+local function trySacredAcidSteal(defender, aGuid, storyActionID)
+    if not aGuid or aGuid == "" then return end
+    if not hasSacredAcidStealPrivilege(aGuid) then return end
+
+    local aKey = guidKey(aGuid)
+    local dKey = guidKey(defender)
+    local swingKey = aKey .. ">" .. dKey
+
+    if storyActionID ~= nil and acidStealLastSwing[swingKey] == storyActionID then
+        return
+    end
+
+    local c = currentSacredAcidStacks(defender, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY, sacredAcidCorrodeStacks)
+    local w = currentSacredAcidStacks(aGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY, sacredAcidWardStacks)
+    local canCorrode = c < SACRED_ACID_CORRODE_CAP
+    local canWard = w < SACRED_ACID_WARD_CAP
+    if not canCorrode and not canWard then
+        return
+    end
+
+    local changed = false
+    if canCorrode then
+        c = c + 1
+        applySacredAcidStackStatus(defender, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY, c, aGuid, sacredAcidCorrodeStacks)
+        changed = true
+    end
+    if canWard then
+        w = w + 1
+        applySacredAcidStackStatus(aGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY, w, aGuid, sacredAcidWardStacks)
+        changed = true
+    end
+    if not changed then return end
+
+    if storyActionID ~= nil then
+        acidStealLastSwing[swingKey] = storyActionID
+    end
+    Ext.Utils.Print(MOD_TAG .. " sacred acid steal corrode=" .. tostring(c) .. " ward=" .. tostring(w)
+        .. " " .. aKey .. " -> " .. dKey)
+end
+
 local function onStatusRemoved(objectGuid, statusName, _, _)
     if statusName == "DWS_CURSED_POISON_STACK_ENH" then
         poisonOwner[guidKey(objectGuid)] = nil
@@ -1052,6 +1584,36 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
             applyStatus(objectGuid, "DWS_SACRED_POISON_CRASH", 1)
         end)
         return
+    end
+
+    if statusName == SACRED_ACID_CORRODE_LEGACY or statusName == SACRED_ACID_WARD_LEGACY then
+        return
+    end
+    for _, tier in ipairs(SACRED_ACID_CORRODE_TIERS) do
+        if statusName == tier then
+            if sacredAcidTierBusy then return end
+            local key = guidKey(objectGuid)
+            local inferred = inferSacredAcidStacksFromTiers(objectGuid, SACRED_ACID_CORRODE_TIERS, SACRED_ACID_CORRODE_LEGACY)
+            if inferred >= 1 then
+                sacredAcidCorrodeStacks[key] = inferred
+            else
+                sacredAcidCorrodeStacks[key] = nil
+            end
+            return
+        end
+    end
+    for _, tier in ipairs(SACRED_ACID_WARD_TIERS) do
+        if statusName == tier then
+            if sacredAcidTierBusy then return end
+            local key = guidKey(objectGuid)
+            local inferred = inferSacredAcidStacksFromTiers(objectGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY)
+            if inferred >= 1 then
+                sacredAcidWardStacks[key] = inferred
+            else
+                sacredAcidWardStacks[key] = nil
+            end
+            return
+        end
     end
 
     if statusName ~= SACRED_MARK and statusName ~= CURSED_MARK then return end
@@ -1076,6 +1638,29 @@ local function onStatusRemoved(objectGuid, statusName, _, _)
 end
 
 local function onTurnStarted(characterGuid)
+    local key = guidKey(characterGuid)
+    if markedCharacters[key] or hasStatus(characterGuid, SACRED_MARK) then
+        Ext.Utils.Print(MOD_TAG .. " TurnStarted " .. key
+            .. " combat=" .. tostring(inCombat(characterGuid))
+            .. " forceTB=" .. tostring(inTurnBasedMode(characterGuid))
+            .. " tile=" .. tostring(currentSacredOf(characterGuid))
+            .. " refreshedWater=" .. tostring(wasOnSacredWaterThisTurn(characterGuid)))
+    end
+
+    safe(function()
+        trySacredWaterTurnStartPending(characterGuid)
+    end)
+
+    -- TB exploration: TurnEnded often never fires; rinse at start of next turn (= end of last).
+    safe(function()
+        if inCombat(characterGuid) then return end
+        if not inTurnBasedMode(characterGuid) then return end
+        local level, hasEnh = sacredWaterCleanseContext(characterGuid)
+        if sacredWaterRinseCon(characterGuid, "TB-explore-turn-start") then
+            tryHeal(characterGuid, "water", sacredWaterHealStatus(level, hasEnh))
+        end
+    end)
+
     -- VITAL layers must refresh even after leaving the zone mark.
     if hasStatus(characterGuid, "DWS_SACRED_POISON_VITAL") then
         safe(function()
@@ -1167,15 +1752,19 @@ local function onAttackedBy(defender, attackerOwner, attacker, damageType, damag
     if type(damageAmount) == "number" and damageAmount <= 0 then return end
 
     clearAgathysIfNoTempHp(defender)
-
     tryBattaryCharge(defender, damageType, damageAmount)
+
+    local aGuid = attacker
+    if not aGuid or aGuid == "" then aGuid = attackerOwner end
+
+    safe(function()
+        trySacredAcidSteal(defender, aGuid, storyActionID)
+    end)
 
     if damageType == "Acid" then return end
     if damageType == "Lightning" then return end
 
     local dKey = guidKey(defender)
-    local aGuid = attacker
-    if not aGuid or aGuid == "" then aGuid = attackerOwner end
     local aKey = guidKey(aGuid)
     local sKey = aKey .. ">" .. dKey
     local echoKey = "echo:" .. dKey
@@ -1220,12 +1809,28 @@ local function onAttackedBy(defender, attackerOwner, attacker, damageType, damag
 end
 
 local function onTurnEnded(characterGuid)
+    local key = guidKey(characterGuid)
+    if markedCharacters[key] or hasStatus(characterGuid, SACRED_MARK) then
+        Ext.Utils.Print(MOD_TAG .. " TurnEnded " .. key
+            .. " combat=" .. tostring(inCombat(characterGuid))
+            .. " turnBased=" .. tostring(inTurnBasedMode(characterGuid))
+            .. " tile=" .. tostring(currentSacredOf(characterGuid)))
+    end
+
+    safe(function()
+        decaySacredAcidStacksOnTurnEnd(characterGuid)
+    end)
+
+    safe(function()
+        -- TB exploration: CON rinse on TurnStarted; avoid double rinse here.
+        if inCombat(characterGuid) or not inTurnBasedMode(characterGuid) then
+            trySacredWaterTurnEnd(characterGuid)
+        end
+    end)
+
     if not hasAnyZoneMark(characterGuid) then return end
     safe(function()
         if not hasStatus(characterGuid,SACRED_MARK) then return end
-        if currentSacredOf(characterGuid) == "DWS_SACRED_CLEANSE_WATHER" then
-            tryHeal(characterGuid, "water", HEAL_2D4)
-        end
 
         for _, sacred in ipairs(ManagedSacred) do
             if hasStatus(characterGuid, sacred)
@@ -1306,6 +1911,18 @@ local function surfacePollTick()
                 pollAndApplySurface(guid)
                 if not inCombat(guid) and hasStatus(guid,SACRED_MARK) then
                     oocHeals(guid)
+                    if not inTurnBasedMode(guid) and isStandingOnSacredWater(guid) then
+                        waterOocTurnPolls[key] = (waterOocTurnPolls[key] or 0) + 1
+                        if waterOocTurnPolls[key] >= POLLS_PER_TURN then
+                            waterOocTurnPolls[key] = 0
+                            trySacredWaterTurnStartPending(guid)
+                            trySacredWaterTurnEnd(guid)
+                        end
+                    else
+                        waterOocTurnPolls[key] = nil
+                    end
+                else
+                    waterOocTurnPolls[key] = nil
                 end
             end
         end

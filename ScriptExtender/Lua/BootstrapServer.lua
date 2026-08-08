@@ -1,6 +1,6 @@
 -- DanceWithSource - Sacred Ground surface dispatcher (v19)
 -- Add cursed surface
-local MOD_TAG = "[DWS v46]"
+local MOD_TAG = "[DWS v52]"
 
 local SACRED_MARK = "DWS_SACRED_GROUND_ZONE"
 local CURSED_MARK = "DWS_CURSED_GROUND_ZONE"
@@ -20,7 +20,7 @@ local POISON_TURNS         = 3     -- poison regen ticks
 local AGATHYS_DURATION     = 18    -- temp HP buff lasts 3 turns
 local AGATHYS_CD_POLLS     = 9     -- cannot re-grant for 3 turns after it expires
 local BLOODLUST_DURATION   = 6
-local BLOOD_COOLDOWN       = 6
+local BLOOD_COOLDOWN       = 6   -- legacy stat duration; kill CD is turn-based in Lua
 local HEAL_GUARD_MS        = 5500  -- min real-time gap between heals of same kind
 local EMPTY_POLLS_TO_LIVE  = 2
 local BATTERY_CHARGE_CD_MS = 600
@@ -118,6 +118,14 @@ local EnchantedConversions = {
         passive  = "DWS_ENH_SACRED_WATER",
         enhanced = "DWS_SACRED_WATER_ENH",
     },
+    ["DWS_SACRED_BLOOD"] = {
+        passive  = "DWS_ENH_SACRED_BLOOD",
+        enhanced = "DWS_SACRED_BLOOD_ENH_1",
+    },
+    ["DWS_SACRED_LIGHTNING"] = {
+        passive  = "DWS_ENH_SACRED_LIGHTNING",
+        enhanced = "DWS_SACRED_LIGHTNING_ENH_1",
+    },
     ["DWS_CURSED_FIRE"] = {
         passive  = "DWS_ENH_CURSED_FIRE", 
         enhanced = "DWS_CURSED_FIRE_ENH",
@@ -186,6 +194,9 @@ local ManagedSacred = {
     "DWS_SACRED_ICE_ENH",
     "DWS_SACRED_ACID",
     "DWS_SACRED_BLOOD",
+    "DWS_SACRED_BLOOD_ENH_1",
+    "DWS_SACRED_BLOOD_ENH_2",
+    "DWS_SACRED_BLOOD_ENH_3",
     "DWS_CURSED_FIRE",
     "DWS_CURSED_OIL",
     "DWS_CURSED_ICE",
@@ -227,6 +238,9 @@ local PersistentSacred = {
     ["DWS_SACRED_POISON_GRACE_3"] = true,
     ["DWS_SACRED_POISON_CRASH"]   = true,
     ["DWS_SACRED_LIGHTNING"]      = true,
+    ["DWS_SACRED_LIGHTNING_ENH_1"] = true,
+    ["DWS_SACRED_LIGHTNING_ENH_2"] = true,
+    ["DWS_SACRED_LIGHTNING_ENH_3"] = true,
     ["DWS_SACRED_ICE_AGATHYS"]    = true,
     ["DWS_SACRED_ICE_AGATHYS_1"]  = true,
     ["DWS_SACRED_ICE_AGATHYS_2"]  = true,
@@ -349,6 +363,28 @@ local WATER_CLEANSE_SAVE_DC = 13
 local WATER_RINSE_OK   = "DWS_SACRED_WATER_RINSE_OK"
 local WATER_RINSE_FAIL = "DWS_SACRED_WATER_RINSE_FAIL"
 local SACRED_WATER_BUFF_DURATION = 12   -- ~2 turns; refreshed while on tile
+local SACRED_BLOOD_BUFF_DURATION = 12
+local SACRED_LIGHTNING_BUFF_DURATION = 12   -- 2 turns after shock
+local LIGHTNING_SACRED_BASE = "DWS_SACRED_LIGHTNING"
+local LIGHTNING_ENH_PASSIVE = "DWS_ENH_SACRED_LIGHTNING"
+local LIGHTNING_ENHS = {
+    "DWS_SACRED_LIGHTNING_ENH_1",
+    "DWS_SACRED_LIGHTNING_ENH_2",
+    "DWS_SACRED_LIGHTNING_ENH_3",
+}
+local LIGHTNING_RIDER_DICE = { 1, 2, 3 }
+local lightningCastGen = {}     -- aKey -> increments on UsingSpell (one rider per cast × target)
+
+local BLOOD_SACRED_BASE   = "DWS_SACRED_BLOOD"
+local BLOOD_ENH_PASSIVE   = "DWS_ENH_SACRED_BLOOD"
+local BLOOD_LUST          = "DWS_SACRED_BLOOD_LUST"
+local BLOOD_ENHS = {
+    "DWS_SACRED_BLOOD_ENH_1",
+    "DWS_SACRED_BLOOD_ENH_2",
+    "DWS_SACRED_BLOOD_ENH_3",
+}
+-- Turns to wait after a kill proc before the next (tier 1/2/3).
+local BLOOD_KILL_CD_AFTER = { 2, 1, 0 }
 
 local WATER_CLEANSE_TIER1 = {
     "BLINDED", "FRIGHTENED", "SLOWED", "SILENCED", "MUTE", "RESTRAINED", "ENWEBBED", "ENTANGLED", "ENSNARED",
@@ -378,6 +414,7 @@ local acidHitBusy = {}       -- swingKey / echoKey -> locked
 local acidHitLastMs = {}     -- swingKey -> last proc ms
 local acidHitLastAction = {} -- swingKey -> storyActionID
 local batteryChargeLastMs = {}  -- dKey -> last ms
+local lightningRiderProcs = {}  -- procKey -> true (one rider per spell cast × target)
 
 local pollCounter           = 0
 local markedCharacters      = {}   -- key -> guid
@@ -399,6 +436,8 @@ local sacredAcidTierBusy    = false -- suppress StatusRemoved while swapping tie
 local waterCleansePending   = {}   -- key -> true: failed end-turn rinse save, remove 1 at next turn start
 local waterBuffStatMissing  = {}   -- statusName -> true if Ext.Stats says stat absent (.pak)
 local waterOocTurnPolls     = {}   -- key -> poll count toward virtual turn (realtime, no TurnEnded)
+local bloodKillCdTurns      = {}   -- key -> turns until sacred blood kill reward ready
+local bloodKillUsedThisTurn = {}   -- key -> true after proc this turn
 local tryHeal               -- forward declaration; defined after applyStatus / hpInfo
 
 Ext.Utils.Print(MOD_TAG .. " bootstrap loaded")
@@ -460,6 +499,131 @@ end
 local function sacredWaterEnhForLevel(level)
     local tier = math.min(3, math.max(1, math.ceil((level or 1) / 4)))
     return WATER_ENHS[tier]
+end
+
+local function sacredBloodEnhForLevel(level)
+    local tier = math.min(3, math.max(1, math.ceil((level or 1) / 4)))
+    return BLOOD_ENHS[tier]
+end
+
+local function sacredLightningEnhForLevel(level)
+    local tier = math.min(3, math.max(1, math.ceil((level or 1) / 4)))
+    return LIGHTNING_ENHS[tier]
+end
+
+local function hasSacredLightningEnh(guid)
+    for _, name in ipairs(LIGHTNING_ENHS) do
+        if hasStatus(guid, name) then return true end
+    end
+    return false
+end
+
+local function sacredLightningRiderTier(attackerGuid)
+    for i, name in ipairs(LIGHTNING_ENHS) do
+        if hasStatus(attackerGuid, name) then return i end
+    end
+    return nil
+end
+
+local function hasSacredLightningBuff(guid)
+    if hasStatus(guid, LIGHTNING_SACRED_BASE) then return true end
+    return hasSacredLightningEnh(guid)
+end
+
+local function sacredBloodKillTier(casterLevel)
+    return math.min(3, math.max(1, math.ceil((casterLevel or 1) / 4)))
+end
+
+local function isStandingOnSacredBlood(guid)
+    return currentSacredOf(guid) == BLOOD_SACRED_BASE
+end
+
+local function hasSacredBloodBuff(guid)
+    if hasStatus(guid, BLOOD_SACRED_BASE) then return true end
+    for _, name in ipairs(BLOOD_ENHS) do
+        if hasStatus(guid, name) then return true end
+    end
+    return false
+end
+
+local function isEnemyCharacter(aGuid, vGuid)
+    if not aGuid or not vGuid or aGuid == "" or vGuid == "" then return false end
+    if guidKey(aGuid) == guidKey(vGuid) then return false end
+    local r
+    pcall(function() r = Osi.IsEnemy(aGuid, vGuid) end)
+    if r == 1 or r == true then return true end
+    local inFight
+    pcall(function() inFight = Osi.IsInCombat(aGuid) end)
+    if inFight == 1 or inFight == true then
+        local isVictimChar
+        pcall(function() isVictimChar = Osi.IsCharacter(vGuid) end)
+        if isVictimChar == 1 or isVictimChar == true then return true end
+    end
+    return false
+end
+
+local function tickSacredBloodKillCdOnTurnEnd(guid)
+    local key = guidKey(guid)
+    bloodKillUsedThisTurn[key] = nil
+    local cd = bloodKillCdTurns[key]
+    if type(cd) == "number" and cd > 0 then
+        bloodKillCdTurns[key] = cd - 1
+    end
+end
+
+local function trySacredBloodKillReward(attacker, victim)
+    local isChar
+    pcall(function() isChar = Osi.IsCharacter(attacker) end)
+    if not (isChar == 1 or isChar == true) then return end
+    local key = guidKey(attacker)
+    if not hasStatus(attacker, SACRED_MARK) then return end
+
+    local function skip(reason)
+        Ext.Utils.Print(MOD_TAG .. " blood kill skip: " .. reason
+            .. " tile=" .. tostring(currentSacredOf(attacker))
+            .. " on " .. key)
+    end
+
+    if not isStandingOnSacredBlood(attacker) then
+        skip("not on blood tile")
+        return
+    end
+    if not hasSacredBloodBuff(attacker) then
+        skip("no blood buff")
+        return
+    end
+    if not isEnemyCharacter(attacker, victim) then
+        skip("victim not enemy")
+        return
+    end
+
+    local caster = zoneOwner[key] or attacker
+    if not hasPassive(caster, BLOOD_ENH_PASSIVE) then
+        skip("zoneOwner missing DWS_ENH_SACRED_BLOOD (pick sacred blood ENH on level-up)")
+        return
+    end
+
+    if bloodKillUsedThisTurn[key] then
+        skip("already proc this turn")
+        return
+    end
+    local wait = bloodKillCdTurns[key] or 0
+    if wait > 0 then
+        skip("cooldown turns left=" .. tostring(wait))
+        return
+    end
+
+    local tier = sacredBloodKillTier(Osi.GetLevel(caster) or 1)
+    local cdAfter = BLOOD_KILL_CD_AFTER[tier] or 2
+
+    applyStatus(attacker, BLOOD_LUST, BLOODLUST_DURATION)
+    markRefreshed(attacker, BLOOD_LUST)
+    bloodKillUsedThisTurn[key] = true
+    bloodKillCdTurns[key] = cdAfter
+
+    Ext.Utils.Print(MOD_TAG .. " blood kill lust tier=" .. tostring(tier)
+        .. " cdAfter=" .. tostring(cdAfter)
+        .. " -> " .. key)
 end
 
 local function hasSacredWaterBuff(guid)
@@ -680,6 +844,12 @@ local function previousEnchanced(guid,baseStatus)
         if baseStatus == WATER_SACRED_BASE then
             return sacredWaterEnhForLevel(Osi.GetLevel(caster) or 1)
         end
+        if baseStatus == BLOOD_SACRED_BASE then
+            return sacredBloodEnhForLevel(Osi.GetLevel(caster) or 1)
+        end
+        if baseStatus == LIGHTNING_SACRED_BASE then
+            return sacredLightningEnhForLevel(Osi.GetLevel(caster) or 1)
+        end
         return entry.enhanced
     end
     return baseStatus
@@ -843,7 +1013,10 @@ local function verifyStatsLoaded()
     local required = {
         HEAL_1D4, HEAL_2D4, "DWS_SACRED_FIRE",
         "DWS_SACRED_FIRE_CLOAK_1", "DWS_SACRED_FIRE_CLOAK_2", "DWS_SACRED_FIRE_CLOAK_3",
-        "DWS_SACRED_LIGHTNING", "DWS_SACRED_OIL", "DWS_SACRED_ICE",
+        "DWS_SACRED_BLOOD_ENH_1", "DWS_SACRED_BLOOD_ENH_2", "DWS_SACRED_BLOOD_ENH_3",
+        "DWS_SACRED_LIGHTNING_ENH_1", "DWS_SACRED_LIGHTNING_ENH_2", "DWS_SACRED_LIGHTNING_ENH_3",
+        BLOOD_LUST,
+        LIGHTNING_SACRED_BASE, "DWS_SACRED_OIL", "DWS_SACRED_ICE",
         "DWS_SACRED_POISON_ENH", "DWS_SACRED_POISON_VITAL",
         "DWS_SACRED_POISON_STING_1", "DWS_SACRED_POISON_SURGE_1",
         "DWS_SACRED_POISON_GRACE_1", "DWS_SACRED_POISON_CRASH",
@@ -994,17 +1167,24 @@ local function tryBattaryCharge(defender,damageType,damageAmount)
     Ext.Utils.Print(MOD_TAG .. " battery charge=" .. tostring(stack) .. " on " .. dKey)
 end
 
-local function applyElectrifiedLightning(objectGuid, isNew)
-    if isNew then
-        Ext.Utils.Print(MOD_TAG .. " [electrified] before: " .. dumpStatuses(objectGuid))
-    end
+local function applySacredLightningFromShock(objectGuid, isNew)
     stripShockStatuses(objectGuid)
-    applyStatus(objectGuid, "DWS_SACRED_LIGHTNING", PERSIST_DURATION)
-    markRefreshed(objectGuid, "DWS_SACRED_LIGHTNING")
+    local status = previousEnchanced(objectGuid, LIGHTNING_SACRED_BASE)
+
+    if status ~= LIGHTNING_SACRED_BASE and hasStatus(objectGuid, LIGHTNING_SACRED_BASE) then
+        Osi.RemoveStatus(objectGuid, LIGHTNING_SACRED_BASE)
+    end
+    for _, name in ipairs(LIGHTNING_ENHS) do
+        if name ~= status and hasStatus(objectGuid, name) then
+            Osi.RemoveStatus(objectGuid, name)
+        end
+    end
+
+    applyStatus(objectGuid, status, SACRED_LIGHTNING_BUFF_DURATION)
+    markRefreshed(objectGuid, status)
     if isNew then
-        Ext.Utils.Print(MOD_TAG .. " [electrified] lightning active=" ..
-            tostring(hasStatus(objectGuid, "DWS_SACRED_LIGHTNING")) ..
-            " | after: " .. dumpStatuses(objectGuid))
+        Ext.Utils.Print(MOD_TAG .. " sacred lightning shock -> " .. status
+            .. " on " .. guidKey(objectGuid))
     end
 end
 
@@ -1180,8 +1360,8 @@ local function applySurfaceEffect(guid, sacred, isNew)
         return
     end
 
-    if sacred == "DWS_SACRED_LIGHTNING" then
-        applyElectrifiedLightning(guid, isNew)
+    if sacred == LIGHTNING_SACRED_BASE then
+        applySacredLightningFromShock(guid, isNew)
         return
     end
 
@@ -1201,6 +1381,17 @@ local function applySurfaceEffect(guid, sacred, isNew)
             Osi.RemoveStatus(guid, WATER_SACRED_BASE)
         end
         for _, name in ipairs(WATER_ENHS) do
+            if name ~= status and hasStatus(guid, name) then
+                Osi.RemoveStatus(guid, name)
+            end
+        end
+    end
+
+    if sacred == BLOOD_SACRED_BASE then
+        if status ~= BLOOD_SACRED_BASE and hasStatus(guid, BLOOD_SACRED_BASE) then
+            Osi.RemoveStatus(guid, BLOOD_SACRED_BASE)
+        end
+        for _, name in ipairs(BLOOD_ENHS) do
             if name ~= status and hasStatus(guid, name) then
                 Osi.RemoveStatus(guid, name)
             end
@@ -1242,7 +1433,12 @@ local function applySurfaceEffect(guid, sacred, isNew)
         }
     end
 
-    local buffDuration = (sacred == WATER_SACRED_BASE) and SACRED_WATER_BUFF_DURATION or SACRED_DURATION
+    local buffDuration = SACRED_DURATION
+    if sacred == WATER_SACRED_BASE then
+        buffDuration = SACRED_WATER_BUFF_DURATION
+    elseif sacred == BLOOD_SACRED_BASE then
+        buffDuration = SACRED_BLOOD_BUFF_DURATION
+    end
     applyStatus(guid, status, buffDuration)
     if sacred == WATER_SACRED_BASE then
         markSacredWaterPollRefresh(guid, status)
@@ -1291,11 +1487,11 @@ local function pollAndApplySurface(characterGuid)
 
     if isElectrifiedSurface(surfaceName) then
         notStillOnSurface(characterGuid)
-        local lightning = (conversions == SurfaceGroundConversions) 
-            and "DWS_SACRED_LIGHTNING"
-            or "DWS_CURSED_LIGHTNING"
-        local isNew = logIfChanged(characterGuid, lightning)
-        applySurfaceEffect(characterGuid, lightning, isNew)
+        if conversions == CursedSurfaceConversions then
+            local isNew = logIfChanged(characterGuid, "DWS_CURSED_LIGHTNING")
+            applySurfaceEffect(characterGuid, "DWS_CURSED_LIGHTNING", isNew)
+        end
+        -- Sacred: buff only from shock (StatusApplied), not from standing on electrified.
         return
     end
 
@@ -1320,7 +1516,6 @@ local function oocHeals(guid)
     if sacred == "DWS_SACRED_FIRE" then
         tryHeal(guid, "fire", HEAL_1D4)
     end
-    -- Sacred water: trySacredWaterTurnEnd on TurnEnded, TB TurnStarted, or OOC virtual turn poll.
 
     local info = poisonHeal[key]
     if info and info.turnsLeft > 0 then
@@ -1523,6 +1718,57 @@ local function decaySacredAcidStacksOnTurnEnd(characterGuid)
         else
             applySacredAcidStackStatus(characterGuid, SACRED_ACID_WARD_TIERS, SACRED_ACID_WARD_LEGACY,
                 nextW, characterGuid, sacredAcidWardStacks)
+        end
+    end
+end
+
+local function trySacredLightningSpellRider(defender, attackerGuid, damageType, damageAmount, storyActionID)
+    if not attackerGuid or attackerGuid == "" then return end
+    if type(damageAmount) == "number" and damageAmount <= 0 then return end
+    if damageType == "Physical" then return end
+
+    local tier = sacredLightningRiderTier(attackerGuid)
+    if not tier then return end
+
+    local dead
+    pcall(function() dead = Osi.IsDead(defender) end)
+    if dead == 1 or dead == true then return end
+
+    local dice = LIGHTNING_RIDER_DICE[tier] or 1
+    local aKey = guidKey(attackerGuid)
+    local dKey = guidKey(defender)
+    local castGen = lightningCastGen[aKey] or 0
+    local procKey = aKey .. ">" .. dKey .. ">" .. tostring(castGen)
+    if lightningRiderProcs[procKey] then return end
+    lightningRiderProcs[procKey] = true
+
+    local amount = rollDice(dice, 4)
+    pcall(function()
+        Osi.ApplyDamage(defender, amount, "Lightning", attackerGuid)
+    end)
+    Ext.Utils.Print(MOD_TAG .. " lightning ENH rider " .. tostring(dice) .. "d4="
+        .. tostring(amount) .. " tier=" .. tostring(tier)
+        .. " castGen=" .. tostring(castGen)
+        .. " " .. aKey .. "->" .. dKey)
+end
+
+local function onUsingSpell(caster, spell, _, _, _)
+    if not hasSacredLightningEnh(caster) then return end
+    local spellId = tostring(spell or "")
+    if spellId:find("SacredGround", 1, true) then return end
+    local key = guidKey(caster)
+    lightningCastGen[key] = (lightningCastGen[key] or 0) + 1
+    Ext.Utils.Print(MOD_TAG .. " spell cast gen=" .. tostring(lightningCastGen[key])
+        .. " spell=" .. spellId .. " " .. key)
+end
+
+local function clearLightningRiderProcsForCharacter(characterGuid)
+    local key = guidKey(characterGuid)
+    local prefix = key .. ">"
+    local suffix = ">" .. key
+    for procKey, _ in pairs(lightningRiderProcs) do
+        if procKey:sub(1, #prefix) == prefix or procKey:sub(-#suffix) == suffix then
+            lightningRiderProcs[procKey] = nil
         end
     end
 end
@@ -1761,6 +2007,10 @@ local function onAttackedBy(defender, attackerOwner, attacker, damageType, damag
         trySacredAcidSteal(defender, aGuid, storyActionID)
     end)
 
+    safe(function()
+        trySacredLightningSpellRider(defender, aGuid, damageType, damageAmount, storyActionID)
+    end)
+
     if damageType == "Acid" then return end
     if damageType == "Lightning" then return end
 
@@ -1822,6 +2072,14 @@ local function onTurnEnded(characterGuid)
     end)
 
     safe(function()
+        tickSacredBloodKillCdOnTurnEnd(characterGuid)
+    end)
+
+    safe(function()
+        clearLightningRiderProcsForCharacter(characterGuid)
+    end)
+
+    safe(function()
         -- TB exploration: CON rinse on TurnStarted; avoid double rinse here.
         if inCombat(characterGuid) or not inTurnBasedMode(characterGuid) then
             trySacredWaterTurnEnd(characterGuid)
@@ -1850,15 +2108,7 @@ local function onKilledBy(victim, _, attacker, _)
     Ext.Utils.Print(MOD_TAG .. " KilledBy fired victim=" .. guidKey(victim))
     safe(function()
         if not attacker or attacker == "" then return end
-        if not hasStatus(attacker, SACRED_MARK)        then return end
-        if not hasStatus(attacker, "DWS_SACRED_BLOOD") then return end
-        if hasStatus(attacker, "DWS_SACRED_BLOOD_CD")  then return end
-
-        applyStatus(attacker, "DWS_SACRED_BLOOD_LUST", BLOODLUST_DURATION)
-        applyStatus(attacker, "DWS_SACRED_BLOOD_CD", BLOOD_COOLDOWN)
-        markRefreshed(attacker, "DWS_SACRED_BLOOD_LUST")
-        markRefreshed(attacker, "DWS_SACRED_BLOOD_CD")
-        Ext.Utils.Print(MOD_TAG .. " bloodlust granted to " .. guidKey(attacker))
+        trySacredBloodKillReward(attacker, victim)
     end)
 
     safe(function()
@@ -1907,6 +2157,8 @@ local function surfacePollTick()
                 lastLoggedSacred[key]    = nil
                 unmappedSurfaceSeen[key] = nil
                 lastHealMs[key]          = nil
+                bloodKillCdTurns[key]    = nil
+                bloodKillUsedThisTurn[key] = nil
             else
                 pollAndApplySurface(guid)
                 if not inCombat(guid) and hasStatus(guid,SACRED_MARK) then
@@ -1937,6 +2189,7 @@ local function installListeners()
     Ext.Osiris.RegisterListener("TurnEnded",     1, "after", onTurnEnded)
     Ext.Osiris.RegisterListener("KilledBy",      4, "after", onKilledBy)
     Ext.Osiris.RegisterListener("AttackedBy",    7, "after", onAttackedBy)
+    Ext.Osiris.RegisterListener("UsingSpell",    5, "after", onUsingSpell)
     Ext.Utils.Print(MOD_TAG .. " Osiris listeners installed")
 end
 
